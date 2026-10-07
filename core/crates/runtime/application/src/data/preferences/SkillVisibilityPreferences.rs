@@ -1,0 +1,44 @@
+use optimuse_store::ExtensionStore::ExtensionStore;
+use optimuse_store::PreferencesDataStore::PreferencesDataStoreError;
+use optimuse_store::RuntimeStorePaths::RuntimeStorePaths;
+
+/// Owns skill visibility in the same scope as the skill itself.
+pub struct SkillVisibilityPreferences;
+
+impl SkillVisibilityPreferences {
+    /// Opens the scope-aware skill visibility facade.
+    #[allow(non_snake_case)]
+    pub fn getInstance() -> Self {
+        Self
+    }
+
+    /// Creates the facade; all data is owned by the installed skill record.
+    pub fn new(_paths: RuntimeStorePaths) -> Self {
+        Self
+    }
+
+    /// Reads the installed skill's explicitly stored AI visibility.
+    #[allow(non_snake_case)]
+    pub fn isSkillVisibleToAi(&self, skillName: &str) -> bool {
+        // A concurrent removal/conflict must not panic while AI enumerates tools.
+        ExtensionStore::default().record("skill", skillName)
+            .ok().and_then(|record| record.settings["visible"].as_bool()).unwrap_or(false)
+    }
+
+    /// Persists AI visibility through the skill's exact owning storage contract.
+    #[allow(non_snake_case)]
+    pub fn setSkillVisibleToAi(
+        &self,
+        skillName: &str,
+        visible: bool,
+    ) -> Result<(), PreferencesDataStoreError> {
+        let store = ExtensionStore::default();
+        let mut record = store
+            .record("skill", skillName)
+            .map_err(PreferencesDataStoreError::Message)?;
+        record.settings["visible"] = serde_json::json!(visible);
+        store
+            .setSettings("skill", skillName, record.settings)
+            .map_err(PreferencesDataStoreError::Message)
+    }
+}

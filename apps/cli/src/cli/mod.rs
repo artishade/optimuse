@@ -1,0 +1,2551 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::ffi::OsStr;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use flate2::read::GzDecoder;
+use optimuse_link::CoreLinkError;
+use optimuse_model::ActivePrompt::ActivePrompt;
+use optimuse_model::ApiKeyInfo::ApiKeyInfo;
+use optimuse_model::AttachmentInfo::AttachmentInfo;
+use optimuse_model::CharacterCard::{
+    CharacterCard, CharacterCardChatModelBindingMode, CharacterCardToolAccessConfig,
+};
+use optimuse_model::CharacterGroupCard::{CharacterGroupCard, GroupMemberConfig};
+use optimuse_model::ChatMessage::ChatMessage;
+use optimuse_model::ChatTurnOptions::ChatTurnOptions;
+use optimuse_model::FunctionType::FunctionType;
+use optimuse_model::InputProcessingState::InputProcessingState;
+use optimuse_model::ModelConfigData::ApiProviderType;
+use optimuse_model::ModelParameter::ModelParameter;
+use optimuse_model::PromptFunctionType::PromptFunctionType;
+use optimuse_model::PromptTag::TagType;
+use optimuse_model::TtsConfig::{TtsConfig, TtsProviderType};
+use optimuse_providers::chat::enhance::ConversationService::ConversationService;
+use optimuse_providers::chat::EnhancedAIService::EnhancedAIService;
+use optimuse_providers::market::MarketStatsApiService::{MarketEntrySummary, MarketListPage};
+use optimuse_runtime::core::chat::ChatRuntimeSlot::ChatRuntimeSlot;
+use optimuse_runtime::data::preferences::ActivePromptManager::ActivePromptManager;
+use optimuse_runtime::data::preferences::ApiPreferences::ApiPreferences;
+use optimuse_runtime::data::preferences::CharacterCardManager::CharacterCardManager;
+use optimuse_runtime::data::preferences::CharacterGroupCardManager::CharacterGroupCardManager;
+use optimuse_runtime::data::preferences::FunctionalConfigManager::FunctionalConfigManager;
+use optimuse_runtime::data::preferences::ModelConfigManager::ModelConfigManager;
+use optimuse_runtime::data::preferences::PromptTagManager::PromptTagManager;
+use optimuse_runtime::data::preferences::TtsConfigManager::TtsConfigManager;
+use optimuse_runtime::services::core::MessageCoordinationDelegate::MessageCoordinationDelegate;
+use optimuse_runtime::services::GitHubOAuthBrokerService::GitHubOAuthBrokerLoginCompletion;
+use optimuse_runtime::services::TtsSynthesisService::TtsSynthesisService;
+use optimuse_store::repository::ChatHistoryManager::ChatHistoryManager;
+use optimuse_tools::tools::ToolPermissionSystem::{AiPermissionMode, PermissionRequestResult};
+use optimuse_tools::ToolExecutionManager::{AITool, ToolParameter};
+use optimuse_util::stream::Stream::Stream;
+use optimuse_util::GithubReleaseUtil::{
+    FullUpdateProgressEvent, FullUpdateStatus, FullUpdateTarget, GithubReleaseUtil,
+};
+use sha2::{Digest, Sha256};
+use tar::Archive;
+use zip::ZipArchive;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+mod host_ops;
+pub(crate) mod link;
+pub(crate) mod network_control_ui;
+mod transfer;
+mod web;
+
+use crate::bootstrap::{
+    cli_identities, create_cli_identity, persist_cli_storage_config,
+    persist_cli_storage_config_json, rename_cli_identity, scope_cli_storage_command_args,
+    select_cli_identity,
+};
+use crate::browser_callback::CliOAuthCallback;
+use crate::chat_runtime::{
+    run_chat_send_command_with_core, run_chat_shell_command_with_core, run_shell_command,
+};
+use crate::core_proxy::local_cli_core;
+use host_ops::{schedule_cli_uninstall, schedule_cli_update};
+use link::run_link_command;
+use transfer::{run_backup_command, run_export_command, run_import_command};
+use web::run_web_command;
+
+const CLI_DEFAULT_TTS_PROVIDER_TYPE: &str = "OPENAI_COMPATIBLE";
+
+static CLI_JSON_MODE: AtomicBool = AtomicBool::new(false);
+
+macro_rules! println {
+    () => { ::std::println!() };
+    ($($arg:tt)*) => { ::std::println!($($arg)*) };
+}
+
+/// Returns whether the active CLI invocation requests JSON.
+pub(crate) fn cli_json_mode() -> bool {
+    CLI_JSON_MODE.load(Ordering::Relaxed)
+}
+
+/// Initializes the CLI output channel for one invocation.
+fn begin_cli_output(json: bool) {
+    CLI_JSON_MODE.store(json, Ordering::Relaxed);
+}
+
+/// Ends the active CLI output mode without rewriting command output.
+fn finish_cli_output() {
+    CLI_JSON_MODE.store(false, Ordering::Relaxed);
+}
+
+/// Emits one explicit JSON value for a CLI-only command.
+pub(crate) fn emit_cli_json(value: serde_json::Value) {
+    ::std::println!(
+        "{}",
+        serde_json::to_string(&value).expect("CLI JSON output must serialize")
+    );
+}
+
+pub(crate) async fn run_cli_root(args: &[String]) -> Result<(), String> {
+    let json = args.iter().any(|arg| arg == "--json");
+    let commandArgs = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--json")
+        .cloned()
+        .collect::<Vec<_>>();
+    begin_cli_output(json);
+    let result = run_cli_root_inner(&commandArgs).await;
+    finish_cli_output();
+    result
+}
+
+/// Dispatches one CLI invocation after global options are removed.
+async fn run_cli_root_inner(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        print_cli_usage();
+        return Ok(());
+    }
+
+    if args[0].as_str() == "link" {
+        return run_link_command(&args[1..]).await;
+    }
+
+    if args[0].as_str() == "identity" {
+        return run_identity_command(&args[1..]);
+    }
+
+    if args[0].as_str() == "web" {
+        return run_web_command(&args[1..]);
+    }
+
+    if args[0].as_str() == "install" {
+        return run_install_cli_command(&args[1..]).await;
+    }
+
+    if args[0].as_str() == "uninstall" {
+        return run_uninstall_cli_command(&args[1..]).await;
+    }
+
+    let localArgs = scope_cli_storage_command_args(args)?;
+    let mut core = local_cli_core().await?;
+
+    let result = match localArgs[0].as_str() {
+        "model" if localArgs.get(1).map(String::as_str) == Some("codex-login") => {
+            run_codex_login_command(&mut core, &localArgs[2..]).await
+        }
+        "model" => run_core_command_and_print(&mut core, &localArgs).await,
+        "version" => run_version_core_command(&mut core).await,
+        "prefs" => run_core_command_and_print(&mut core, &args).await,
+        "host" => run_core_command_and_print(&mut core, &args).await,
+        "log" => run_core_command_and_print(&mut core, &args).await,
+        "local-models" => run_core_command_and_print(&mut core, &args).await,
+        "stt" => run_core_command_and_print(&mut core, &args).await,
+        "memory" => run_core_command_and_print(&mut core, &args).await,
+        "tts" => run_tts_cli_command(&core, &args[1..]).await,
+        "export" => run_export_command(&mut core, &args[1..]).await,
+        "import" => run_import_command(&mut core, &args[1..]).await,
+        "backup" => run_backup_command(&mut core, &args[1..]).await,
+        "chat" if args.get(1).map(String::as_str) == Some("send") => {
+            run_chat_send_command_with_core(&mut core, &args[2..]).await
+        }
+        "chat" if args.get(1).map(String::as_str) == Some("shell") => {
+            run_chat_shell_command_with_core(&mut core, &args[2..]).await
+        }
+        "chat" => run_core_command_and_print(&mut core, &args).await,
+        "workspace" => run_core_command_and_print(&mut core, &args).await,
+        "storage" => run_local_core_command_and_print(&mut core, &localArgs).await,
+        "shell" => run_shell_command(&mut core, &args[1..]).await,
+        "tag" => run_core_command_and_print(&mut core, &args).await,
+        "character" => run_core_command_and_print(&mut core, &args).await,
+        "group" => run_core_command_and_print(&mut core, &args).await,
+        "active-prompt" => run_core_command_and_print(&mut core, &args).await,
+        "approval" => run_core_command_and_print(&mut core, &args).await,
+        "tool" => run_core_command_and_print(&mut core, &args).await,
+        "market" => run_market_cli_command(&mut core, &args).await,
+        "update" => run_update_cli_command(&mut core, &args[1..]).await,
+        "extension" => run_core_command_and_print(&mut core, &args).await,
+        "skill" => run_core_command_and_print(&mut core, &args).await,
+        "package" => run_core_command_and_print(&mut core, &args).await,
+        "plugin" => run_core_command_and_print(&mut core, &args).await,
+        "mcp" => run_core_command_and_print(&mut core, &args).await,
+        "usage" => run_core_command_and_print(&mut core, &args).await,
+        _ => {
+            print_cli_usage();
+            Ok(())
+        }
+    };
+    result.map_err(rewrite_cli_usage_message)
+}
+
+/// Runs local identity management before any Core runtime is created.
+/// Runs identity management commands and emits a stable result document when requested.
+fn run_identity_command(args: &[String]) -> Result<(), String> {
+    match args {
+        [command] if command == "list" => {
+            let (identities, activeIdentityId) = cli_identities();
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({
+                    "identities": identities,
+                    "activeIdentityId": activeIdentityId,
+                }));
+                return Ok(());
+            }
+            for identity in identities {
+                println!(
+                    "{} ({}){}",
+                    identity.name,
+                    identity.id,
+                    if identity.id == activeIdentityId {
+                        " [current]"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+        [command] if command == "current" => {
+            let (identities, activeIdentityId) = cli_identities();
+            let identity = identities
+                .into_iter()
+                .find(|identity| identity.id == activeIdentityId)
+                .expect("active CLI identity must exist");
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!(identity));
+            } else {
+                println!("{} ({})", identity.name, identity.id);
+            }
+            Ok(())
+        }
+        [command, name] if command == "create" => {
+            let identity = create_cli_identity(name.clone())?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!(identity));
+            } else {
+                println!("Created identity {} ({})", identity.name, identity.id);
+            }
+            Ok(())
+        }
+        [command, identityId] if command == "use" => {
+            select_cli_identity(identityId)?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({ "activeIdentityId": identityId }));
+            } else {
+                println!("Active identity: {identityId}");
+            }
+            Ok(())
+        }
+        [command, identityId, name] if command == "rename" => {
+            rename_cli_identity(identityId, name.clone())?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({ "id": identityId, "name": name.trim() }));
+            } else {
+                println!("Renamed identity {identityId} to {}", name.trim());
+            }
+            Ok(())
+        }
+        _ => {
+            print_identity_usage();
+            Ok(())
+        }
+    }
+}
+
+/// Runs local CLI text-to-speech configuration and synthesis commands.
+async fn run_tts_cli_command(
+    core: &crate::core_proxy::CliCore,
+    args: &[String],
+) -> Result<(), String> {
+    match args.get(0).map(String::as_str) {
+        Some("config") => run_tts_config_cli_command(&args[1..]),
+        Some("synthesize") => run_tts_synthesize_cli_command(core, &args[1..]),
+        _ => {
+            print_tts_usage();
+            Ok(())
+        }
+    }
+}
+
+/// Runs text-to-speech configuration commands against the shared preference store.
+/// Runs TTS configuration commands with readable text or explicit JSON output.
+fn run_tts_config_cli_command(args: &[String]) -> Result<(), String> {
+    let manager = TtsConfigManager::getInstance();
+    match args.get(0).map(String::as_str) {
+        Some("list") if args.len() == 1 => {
+            let currentConfigId = manager.getCurrentTtsConfigId()?;
+            let configs = manager.getAllTtsConfigs()?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({
+                    "configs": configs,
+                    "currentConfigId": currentConfigId,
+                }));
+                return Ok(());
+            }
+            for config in configs {
+                let currentMark = if config.id == currentConfigId {
+                    " (current)"
+                } else {
+                    ""
+                };
+                println!(
+                    "{} ({}) — {} / {} / {}{}",
+                    config.name,
+                    config.id,
+                    config.providerType,
+                    config.model,
+                    config.voice,
+                    currentMark
+                );
+            }
+            Ok(())
+        }
+        Some("show") if args.len() == 2 => {
+            let config = manager.getTtsConfig(&args[1])?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!(config));
+            } else {
+                print_tts_config_human(&config);
+            }
+            Ok(())
+        }
+        Some("current") if args.len() == 1 => {
+            let config = manager.getCurrentTtsConfig()?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!(config));
+            } else {
+                print_tts_config_human(&config);
+            }
+            Ok(())
+        }
+        Some("use") if args.len() == 2 => {
+            let id = manager.setCurrentTtsConfigId(&args[1])?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({ "currentConfigId": id }));
+            } else {
+                println!("Active TTS configuration: {id}");
+            }
+            Ok(())
+        }
+        Some("create") if args.len() == 8 => {
+            let responseFormat = args[6].clone();
+            let speed = args[7].parse::<f64>().map_err(|error| error.to_string())?;
+            let config = manager.createTtsConfig(TtsConfig {
+                id: String::new(),
+                name: args[1].clone(),
+                providerType: CLI_DEFAULT_TTS_PROVIDER_TYPE.to_string(),
+                endpoint: args[2].clone(),
+                apiKey: args[3].clone(),
+                model: args[4].clone(),
+                voice: args[5].clone(),
+                responseFormat,
+                speed,
+                httpMethod: "POST".to_string(),
+                requestBody: String::new(),
+                contentType: "application/json".to_string(),
+                headers: Vec::new(),
+                responsePipeline: Vec::new(),
+                createdAt: 0,
+                updatedAt: 0,
+            })?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!(config));
+            } else {
+                println!("Created TTS configuration {} ({})", config.name, config.id);
+            }
+            Ok(())
+        }
+        Some("create-local") if args.len() == 6 => {
+            let speed = args[5].parse::<f64>().map_err(|error| error.to_string())?;
+            let config = manager.createTtsConfig(TtsConfig {
+                id: String::new(),
+                name: args[1].clone(),
+                providerType: TtsProviderType::LOCAL_MODEL.to_string(),
+                endpoint: String::new(),
+                apiKey: String::new(),
+                model: format!("{}@{}", args[2], args[3]),
+                voice: args[4].clone(),
+                responseFormat: "wav".to_string(),
+                speed,
+                httpMethod: "POST".to_string(),
+                requestBody: String::new(),
+                contentType: "application/json".to_string(),
+                headers: Vec::new(),
+                responsePipeline: Vec::new(),
+                createdAt: 0,
+                updatedAt: 0,
+            })?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!(config));
+            } else {
+                println!(
+                    "Created local TTS configuration {} ({})",
+                    config.name, config.id
+                );
+            }
+            Ok(())
+        }
+        Some("update") if args.len() == 4 => {
+            let mut config = manager.getTtsConfig(&args[1])?;
+            match args[2].as_str() {
+                "name" => config.name = args[3].clone(),
+                "endpoint" => config.endpoint = args[3].clone(),
+                "api-key" => config.apiKey = args[3].clone(),
+                "model" => config.model = args[3].clone(),
+                "voice" => config.voice = args[3].clone(),
+                "response-format" => config.responseFormat = args[3].clone(),
+                "speed" => {
+                    config.speed = args[3].parse::<f64>().map_err(|error| error.to_string())?
+                }
+                "http-method" => config.httpMethod = args[3].clone(),
+                "request-body" => config.requestBody = args[3].clone(),
+                "content-type" => config.contentType = args[3].clone(),
+                field => return Err(format!("unknown tts config field: {field}")),
+            }
+            let updated = manager.updateTtsConfig(config)?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!(updated));
+            } else {
+                println!("Updated TTS configuration {}", updated.id);
+            }
+            Ok(())
+        }
+        Some("delete") if args.len() == 2 => {
+            let deleted = manager.deleteTtsConfig(&args[1])?;
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({ "deleted": deleted, "id": args[1] }));
+            } else {
+                println!("Deleted TTS configuration {}", args[1]);
+            }
+            Ok(())
+        }
+        _ => {
+            print_tts_usage();
+            Ok(())
+        }
+    }
+}
+
+/// Synthesizes speech through a character or exact TTS configuration.
+/// Synthesizes speech through the selected character or TTS configuration.
+fn run_tts_synthesize_cli_command(
+    core: &crate::core_proxy::CliCore,
+    args: &[String],
+) -> Result<(), String> {
+    let mut characterId: Option<String> = None;
+    let mut configId: Option<String> = None;
+    let mut text: Option<String> = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--character" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--character requires a value".to_string())?;
+                characterId = Some(value.clone());
+            }
+            "--text" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--text requires a value".to_string())?;
+                text = Some(value.clone());
+            }
+            "--config" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--config requires a value".to_string())?;
+                configId = Some(value.clone());
+            }
+            value => return Err(format!("unknown tts synthesize argument: {value}")),
+        }
+        index += 1;
+    }
+    let text = text.ok_or_else(|| "--text is required".to_string())?;
+    let service = TtsSynthesisService::getInstance(core.localHostManager()?);
+    let result = match (characterId, configId) {
+        (Some(characterId), None) => service.synthesizeForCharacter(&characterId, &text)?,
+        (None, Some(configId)) => service.synthesizeWithConfig(&configId, &text)?,
+        _ => {
+            return Err(
+                "tts synthesize requires exactly one of --character or --config".to_string(),
+            )
+        }
+    };
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({ "audioPaths": result.audioPaths }));
+    } else {
+        for path in result.audioPaths {
+            println!("Audio: {path}");
+        }
+    }
+    Ok(())
+}
+
+/// Prints text-to-speech CLI usage.
+/// Prints TTS command usage in the selected output format.
+fn print_tts_usage() {
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({ "usage": "optimuse cli tts config|synthesize" }));
+        return;
+    }
+    println!("optimuse cli tts config list");
+    println!("optimuse cli tts config show <id>");
+    println!("optimuse cli tts config current");
+    println!("optimuse cli tts config use <id>");
+    println!("optimuse cli tts config create <name> <endpoint> <api-key> <model> <voice> <response-format> <speed>");
+    println!("optimuse cli tts config create-local <name> <model-id> <version> <voice> <speed>");
+    println!("optimuse cli tts config update <id> <name|endpoint|api-key|model|voice|response-format|speed|http-method|request-body|content-type> <value>");
+    println!("optimuse cli tts config delete <id>");
+    println!("optimuse cli tts synthesize --character <id> --text <text>");
+    println!("optimuse cli tts synthesize --config <id> --text <text>");
+}
+
+/// Runs update discovery, download, and installation commands.
+async fn run_update_cli_command(
+    core: &mut crate::core_proxy::CliCore,
+    args: &[String],
+) -> Result<(), String> {
+    if args.is_empty() {
+        let target = FullUpdateTarget::cliForCurrentHost()?;
+        return run_update_with_progress(
+            env!("CARGO_PKG_VERSION"),
+            target,
+            UpdateApplyMode::InstallCurrentTarget,
+        )
+        .await;
+    }
+
+    match args[0].as_str() {
+        "check" if args.len() == 1 => {
+            let target = FullUpdateTarget::cliForCurrentHost()?;
+            let command = vec![
+                "update".to_string(),
+                "check".to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+                target.product,
+                target.platform,
+                target.arch,
+            ];
+            run_core_command_and_print(core, &command).await
+        }
+        "target" if args.len() == 1 => {
+            let target = FullUpdateTarget::cliForCurrentHost()?;
+            print_update_target(target)
+        }
+        "run" if args.len() == 2 => {
+            let current_version = args.get(1).ok_or_else(|| cli_update_usage("run"))?;
+            let target = FullUpdateTarget::cliForCurrentHost()?;
+            run_update_with_progress(
+                current_version,
+                target,
+                UpdateApplyMode::InstallCurrentTarget,
+            )
+            .await
+        }
+        "download" if args.len() == 2 => {
+            let current_version = args.get(1).ok_or_else(|| cli_update_usage("download"))?;
+            let target = FullUpdateTarget::cliForCurrentHost()?;
+            run_update_with_progress(current_version, target, UpdateApplyMode::DownloadOnly).await
+        }
+        "check" if args.len() == 2 => {
+            let current_version = args.get(1).ok_or_else(|| cli_update_usage("check"))?;
+            let target = FullUpdateTarget::cliForCurrentHost()?;
+            let command = vec![
+                "update".to_string(),
+                "check".to_string(),
+                current_version.to_string(),
+                target.product,
+                target.platform,
+                target.arch,
+            ];
+            run_core_command_and_print(core, &command).await
+        }
+        _ => {
+            print_update_usage();
+            Ok(())
+        }
+    }
+}
+
+/// Builds the usage string for one update subcommand.
+fn cli_update_usage(command: &str) -> String {
+    format!("usage: optimuse cli update {command} <current-version>")
+}
+
+/// Prints the current update target in the selected output format.
+fn print_update_target(target: FullUpdateTarget) -> Result<(), String> {
+    let package_name = target.assetName()?;
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({
+            "platform": target.platform,
+            "arch": target.arch,
+            "package": package_name,
+        }));
+    } else {
+        println!("Platform: {}", target.platform);
+        println!("Architecture: {}", target.arch);
+        println!("Package: {package_name}");
+    }
+    Ok(())
+}
+
+/// Prints one TTS configuration as readable labeled text.
+fn print_tts_config_human(config: &TtsConfig) {
+    println!("TTS configuration {}", config.id);
+    println!("Name: {}", config.name);
+    println!("Provider: {}", config.providerType);
+    println!("Endpoint: {}", config.endpoint);
+    println!("Model: {}", config.model);
+    println!("Voice: {}", config.voice);
+    println!("Response format: {}", config.responseFormat);
+    println!("Speed: {}", config.speed);
+    println!("HTTP method: {}", config.httpMethod);
+    println!("Content type: {}", config.contentType);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateApplyMode {
+    InstallCurrentTarget,
+    DownloadOnly,
+}
+
+/// Checks, downloads, and optionally installs a full CLI update.
+async fn run_update_with_progress(
+    current_version: &str,
+    target: FullUpdateTarget,
+    apply_mode: UpdateApplyMode,
+) -> Result<(), String> {
+    let package_name = target.assetName()?;
+    let target_for_install = target.clone();
+    let channel = GithubReleaseUtil::fullUpdateChannelForVersion(current_version)?;
+    let status = GithubReleaseUtil::checkForFullUpdateBlocking(current_version, target)?;
+    match status {
+        FullUpdateStatus::Available(info) => {
+            let work_dir = std::env::temp_dir().join("optimuse").join("full_update");
+            let last_line_len = Arc::new(Mutex::new(0usize));
+            let progress_line_len = Arc::clone(&last_line_len);
+            let package_path = GithubReleaseUtil::downloadAndPrepareFullUpdateBlocking(
+                &info.downloadUrl,
+                &info.assetName,
+                &work_dir,
+                move |event| match event {
+                    FullUpdateProgressEvent::StageChanged { stage: _, message } => {
+                        let mut last_line_len = progress_line_len
+                            .lock()
+                            .expect("progress line length mutex poisoned");
+                        clear_progress_line(&mut *last_line_len);
+                        if !cli_json_mode() {
+                            println!("{message}");
+                        }
+                    }
+                    FullUpdateProgressEvent::DownloadProgress {
+                        readBytes,
+                        totalBytes,
+                        speedBytesPerSec,
+                    } => {
+                        let percent = readBytes as f64 * 100.0 / totalBytes as f64;
+                        let line = format!(
+                            "download={percent:.1}% bytes={}/{} speed={}/s",
+                            format_bytes(readBytes),
+                            format_bytes(totalBytes),
+                            format_bytes(speedBytesPerSec),
+                        );
+                        let mut last_line_len = progress_line_len
+                            .lock()
+                            .expect("progress line length mutex poisoned");
+                        if cli_json_mode() {
+                            return;
+                        }
+                        print!("\r{line}");
+                        if *last_line_len > line.len() {
+                            print!("{}", " ".repeat(*last_line_len - line.len()));
+                            print!("\r{line}");
+                        }
+                        io::stdout().flush().expect("stdout flush failed");
+                        *last_line_len = line.len();
+                    }
+                },
+            )?;
+            let mut last_line_len = last_line_len
+                .lock()
+                .expect("progress line length mutex poisoned");
+            clear_progress_line(&mut *last_line_len);
+            let mut install_status = None;
+            if apply_mode == UpdateApplyMode::InstallCurrentTarget {
+                install_status = Some(handle_downloaded_update_package(
+                    &target_for_install,
+                    &package_path,
+                )?);
+            }
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({
+                    "status": "downloaded",
+                    "currentVersion": current_version,
+                    "channel": format!("{channel:?}").to_ascii_lowercase(),
+                    "latestVersion": info.version,
+                    "package": info.assetName,
+                    "packagePath": package_path,
+                    "releasePageUrl": info.releasePageUrl,
+                    "installMode": if apply_mode == UpdateApplyMode::InstallCurrentTarget { "install" } else { "download-only" },
+                    "installStatus": install_status.map(downloaded_update_install_status_name),
+                }));
+            } else {
+                println!("Update available: {}", info.version);
+                println!("Current version: {current_version}");
+                println!("Channel: {channel}");
+                println!("Package: {}", info.assetName);
+                println!("Downloaded to: {}", package_path.display());
+                println!("Release page: {}", info.releasePageUrl);
+                if apply_mode == UpdateApplyMode::DownloadOnly {
+                    println!("Install status: download-only");
+                }
+            }
+        }
+        FullUpdateStatus::UpToDate => {
+            if cli_json_mode() {
+                emit_cli_json(serde_json::json!({
+                    "status": "up-to-date",
+                    "currentVersion": current_version,
+                    "channel": format!("{channel:?}").to_ascii_lowercase(),
+                    "package": package_name,
+                }));
+            } else {
+                println!("Already up to date ({current_version})");
+                println!("Channel: {channel}");
+                println!("Package: {package_name}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn clear_progress_line(last_line_len: &mut usize) {
+    if *last_line_len == 0 {
+        return;
+    }
+    print!("\r{}\r", " ".repeat(*last_line_len));
+    io::stdout().flush().expect("stdout flush failed");
+    *last_line_len = 0;
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+async fn run_install_cli_command(args: &[String]) -> Result<(), String> {
+    if matches!(args, [command] if command == "status") {
+        return print_cli_install_status();
+    }
+    let source = match args {
+        [] => env::current_exe().map_err(|error| error.to_string())?,
+        [flag, value] if flag == "--source" => PathBuf::from(value),
+        _ => {
+            print_install_usage();
+            return Ok(());
+        }
+    };
+    install_cli_from_source(&source, InstallMode::Direct, InstallOutput::Print, |_| {})
+}
+
+async fn run_uninstall_cli_command(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        print_uninstall_usage();
+        return Ok(());
+    }
+    uninstall_cli()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DownloadedUpdateInstallStatus {
+    Installed,
+    Scheduled,
+    NotInstalled,
+    TargetMismatch,
+}
+
+pub(crate) fn install_downloaded_cli_update(
+    target: &FullUpdateTarget,
+    package_path: &Path,
+    output: InstallOutput,
+) -> Result<DownloadedUpdateInstallStatus, String> {
+    if target.product != "cli" {
+        return Ok(DownloadedUpdateInstallStatus::TargetMismatch);
+    }
+    let current_target = FullUpdateTarget::cliForCurrentHost()?;
+    if target != &current_target {
+        return Ok(DownloadedUpdateInstallStatus::TargetMismatch);
+    }
+    let source = extract_cli_binary_from_package(target, package_path)?;
+    let install_state = current_cli_install_state()?;
+    match install_state {
+        CliInstallState::Installed => {
+            install_cli_from_source(&source, InstallMode::Update, output, |_| {})?;
+            Ok(DownloadedUpdateInstallStatus::Scheduled)
+        }
+        CliInstallState::NotInstalled => Ok(DownloadedUpdateInstallStatus::NotInstalled),
+    }
+}
+
+/// Installs a downloaded package and returns the exact installation outcome.
+fn handle_downloaded_update_package(
+    target: &FullUpdateTarget,
+    package_path: &Path,
+) -> Result<DownloadedUpdateInstallStatus, String> {
+    let status = install_downloaded_cli_update(
+        target,
+        package_path,
+        if cli_json_mode() {
+            InstallOutput::Silent
+        } else {
+            InstallOutput::Print
+        },
+    )?;
+    if !cli_json_mode() {
+        match status {
+            DownloadedUpdateInstallStatus::Installed => {}
+            DownloadedUpdateInstallStatus::Scheduled => {}
+            DownloadedUpdateInstallStatus::NotInstalled => {
+                println!("Install status: not installed")
+            }
+            DownloadedUpdateInstallStatus::TargetMismatch => {
+                println!("Install status: target mismatch")
+            }
+        }
+    }
+    Ok(status)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliInstallState {
+    Installed,
+    NotInstalled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMode {
+    Direct,
+    Update,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallOutput {
+    Print,
+    Silent,
+}
+
+pub(crate) fn install_current_cli(output: InstallOutput) -> Result<(), String> {
+    install_current_cli_with_progress(output, |_| {})
+}
+
+pub(crate) fn install_current_cli_with_progress<F>(
+    output: InstallOutput,
+    on_progress: F,
+) -> Result<(), String>
+where
+    F: FnMut(CliInstallProgress),
+{
+    let source = env::current_exe().map_err(|error| error.to_string())?;
+    install_cli_from_source(&source, InstallMode::Direct, output, on_progress)
+}
+
+pub(crate) fn cli_is_installed() -> Result<bool, String> {
+    Ok(current_cli_install_state()? == CliInstallState::Installed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CliInstallProgress {
+    CopyOptimuse,
+    CopyOptimuse,
+    UpdatePath,
+    Complete,
+}
+
+fn install_cli_from_source(
+    source: &Path,
+    mode: InstallMode,
+    output: InstallOutput,
+    mut on_progress: impl FnMut(CliInstallProgress),
+) -> Result<(), String> {
+    if !source.is_file() {
+        return Err(format!(
+            "Optimuse CLI binary not found: {}",
+            source.display()
+        ));
+    }
+
+    let install_dir = cli_install_dir()?;
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    fs::create_dir_all(&install_dir).map_err(|error| error.to_string())?;
+
+    if mode == InstallMode::Update {
+        schedule_cli_update(source, &optimuse, &optimuse, &install_dir)?;
+        print_install_scheduled(&install_dir, output);
+        return Ok(());
+    }
+
+    on_progress(CliInstallProgress::CopyOptimuse);
+    copy_cli_binary(source, &optimuse)?;
+    on_progress(CliInstallProgress::CopyOptimuse);
+    copy_cli_binary(source, &optimuse)?;
+    on_progress(CliInstallProgress::UpdatePath);
+    add_cli_install_dir_to_path(&install_dir)?;
+    on_progress(CliInstallProgress::Complete);
+
+    print_install_installed(&install_dir, output);
+    Ok(())
+}
+
+/// Reports a completed direct CLI installation.
+fn print_install_installed(install_dir: &Path, output: InstallOutput) {
+    if output == InstallOutput::Silent {
+        return;
+    }
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({
+            "installStatus": "installed",
+            "installDir": install_dir,
+            "commands": ["optimuse", "optimuse"],
+        }));
+    } else {
+        println!("Installed to {}", install_dir.display());
+        println!("Commands: optimuse, optimuse");
+    }
+}
+
+/// Converts an update installation status into its stable CLI identifier.
+fn downloaded_update_install_status_name(status: DownloadedUpdateInstallStatus) -> &'static str {
+    match status {
+        DownloadedUpdateInstallStatus::Installed => "installed",
+        DownloadedUpdateInstallStatus::Scheduled => "scheduled",
+        DownloadedUpdateInstallStatus::NotInstalled => "not-installed",
+        DownloadedUpdateInstallStatus::TargetMismatch => "target-mismatch",
+    }
+}
+
+/// Reports an installation scheduled for the next terminal restart.
+fn print_install_scheduled(install_dir: &Path, output: InstallOutput) {
+    if output == InstallOutput::Silent {
+        return;
+    }
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({
+            "installStatus": "scheduled",
+            "installDir": install_dir,
+            "message": "restart-terminal-after-update",
+        }));
+    } else {
+        println!("Update scheduled; restart the terminal to apply it.");
+        println!("Install directory: {}", install_dir.display());
+    }
+}
+
+/// Uninstalls the CLI and reports the exact resulting state.
+fn uninstall_cli() -> Result<(), String> {
+    let install_dir = cli_install_dir()?;
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+
+    if current_exe_is_installed_cli()? {
+        schedule_cli_uninstall(&optimuse, &optimuse, &install_dir)?;
+        if cli_json_mode() {
+            emit_cli_json(serde_json::json!({
+                "uninstallStatus": "scheduled",
+                "installDir": install_dir,
+                "message": "restart-terminal-after-uninstall",
+            }));
+        } else {
+            println!("Uninstall scheduled; restart the terminal to apply it.");
+            println!("Install directory: {}", install_dir.display());
+        }
+        return Ok(());
+    }
+
+    remove_file_if_exists(&optimuse)?;
+    remove_file_if_exists(&optimuse)?;
+    remove_cli_install_dir_from_path(&install_dir)?;
+
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({
+            "uninstallStatus": "uninstalled",
+            "installDir": install_dir,
+        }));
+    } else {
+        println!("Uninstalled from {}", install_dir.display());
+    }
+    Ok(())
+}
+
+fn current_cli_install_state() -> Result<CliInstallState, String> {
+    let install_dir = cli_install_dir()?;
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    if path_is_file(&optimuse)? || path_is_file(&optimuse)? {
+        Ok(CliInstallState::Installed)
+    } else {
+        Ok(CliInstallState::NotInstalled)
+    }
+}
+
+fn current_exe_is_installed_cli() -> Result<bool, String> {
+    let current = normalize_existing_path(&env::current_exe().map_err(|error| error.to_string())?)?;
+    let install_dir = cli_install_dir()?;
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    Ok(existing_paths_equal(&current, &optimuse)? || existing_paths_equal(&current, &optimuse)?)
+}
+
+/// Reports the current CLI installation state.
+fn print_cli_install_status() -> Result<(), String> {
+    let install_dir = cli_install_dir()?;
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    let optimuse = cli_command_path(&install_dir, "optimuse");
+    let optimuse_exists = path_is_file(&optimuse)?;
+    let optimuse_exists = path_is_file(&optimuse)?;
+    let installed = current_cli_install_state()? == CliInstallState::Installed;
+    let path_contains_install_dir = cli_install_dir_is_on_path(&install_dir)?;
+    let current_exe_is_installed = current_exe_is_installed_cli()?;
+    let current_exe = env::current_exe().map_err(|error| error.to_string())?;
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({
+            "installDir": install_dir,
+            "optimusePath": optimuse,
+            "optimuseExists": optimuse_exists,
+            "optimusePath": optimuse,
+            "optimuseExists": optimuse_exists,
+            "installed": installed,
+            "pathContainsInstallDir": path_contains_install_dir,
+            "currentExeIsInstalled": current_exe_is_installed,
+            "currentExe": current_exe,
+        }));
+    } else {
+        println!("Install directory: {}", install_dir.display());
+        println!(
+            "optimuse: {} ({})",
+            optimuse.display(),
+            if optimuse_exists { "present" } else { "missing" }
+        );
+        println!(
+            "optimuse: {} ({})",
+            optimuse.display(),
+            if optimuse_exists { "present" } else { "missing" }
+        );
+        println!("Installed: {installed}");
+        println!("PATH contains install directory: {path_contains_install_dir}");
+        println!("Current executable is installed: {current_exe_is_installed}");
+        println!("Current executable: {}", current_exe.display());
+    }
+    Ok(())
+}
+
+fn cli_command_path(install_dir: &Path, name: &str) -> PathBuf {
+    install_dir.join(cli_command_file_name(name))
+}
+
+fn cli_command_file_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    }
+}
+
+fn cli_install_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let local_app_data =
+            env::var_os("LOCALAPPDATA").ok_or_else(|| "LOCALAPPDATA is required".to_string())?;
+        return Ok(PathBuf::from(local_app_data)
+            .join("Programs")
+            .join("Optimuse")
+            .join("bin"));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let home = env::var_os("HOME").ok_or_else(|| "HOME is required".to_string())?;
+        return Ok(PathBuf::from(home).join(".local").join("bin"));
+    }
+}
+
+fn cli_profile_file() -> Result<PathBuf, String> {
+    let home = env::var_os("HOME").ok_or_else(|| "HOME is required".to_string())?;
+    Ok(PathBuf::from(home).join(".profile"))
+}
+
+fn copy_cli_binary(source: &Path, destination: &Path) -> Result<(), String> {
+    if existing_paths_equal(source, destination)? {
+        set_cli_binary_permissions(destination)?;
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        return copy_cli_binary_atomic(source, destination);
+    }
+
+    #[cfg(windows)]
+    {
+        fs::copy(source, destination).map_err(|error| {
+            format!(
+                "Failed to copy {} to {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        set_cli_binary_permissions(destination)?;
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn copy_cli_binary_atomic(source: &Path, destination: &Path) -> Result<(), String> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| format!("invalid destination: {}", destination.display()))?;
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("invalid destination file name: {}", destination.display()))?;
+    let temp = parent.join(format!(".{file_name}.tmp-{}", unique_suffix()));
+
+    fs::copy(source, &temp).map_err(|error| {
+        format!(
+            "Failed to copy {} to {}: {error}",
+            source.display(),
+            temp.display()
+        )
+    })?;
+    set_cli_binary_permissions(&temp)?;
+    match fs::rename(&temp, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(format!(
+                "Failed to replace {} with {}: {error}",
+                destination.display(),
+                source.display()
+            ))
+        }
+    }
+}
+
+fn set_cli_binary_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove {}: {error}", path.display())),
+    }
+}
+
+fn normalize_existing_path(path: &Path) -> Result<PathBuf, String> {
+    fs::canonicalize(path).map_err(|error| format!("Failed to resolve {}: {error}", path.display()))
+}
+
+fn path_is_file(path: &Path) -> Result<bool, String> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("Failed to inspect {}: {error}", path.display())),
+    }
+}
+
+fn existing_paths_equal(left: &Path, right: &Path) -> Result<bool, String> {
+    let left = normalize_existing_path(left)?;
+    let right = match fs::canonicalize(right) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Failed to resolve {}: {error}", right.display())),
+    };
+    if cfg!(windows) {
+        Ok(left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(right.to_string_lossy().as_ref()))
+    } else {
+        Ok(left == right)
+    }
+}
+
+fn add_cli_install_dir_to_path(install_dir: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let current_path = read_windows_user_path()?;
+        let mut parts = split_windows_path(&current_path);
+        if !windows_path_parts_contain(&parts, install_dir) {
+            parts.push(install_dir.display().to_string());
+            write_windows_user_path(&parts.join(";"))?;
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let profile_file = cli_profile_file()?;
+        let path_line = cli_unix_path_line();
+        let current = read_text_file_when_present(&profile_file)?;
+        let exists = current.lines().any(|line| line == path_line);
+        if !exists {
+            let mut next = current;
+            if !next.is_empty() && !next.ends_with('\n') {
+                next.push('\n');
+            }
+            next.push_str(path_line);
+            next.push('\n');
+            fs::write(&profile_file, next).map_err(|error| error.to_string())?;
+        }
+        return Ok(());
+    }
+}
+
+fn cli_install_dir_is_on_path(install_dir: &Path) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let current_path = read_windows_user_path()?;
+        let parts = split_windows_path(&current_path);
+        return Ok(windows_path_parts_contain(&parts, install_dir));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let profile_file = cli_profile_file()?;
+        let current = read_text_file_when_present(&profile_file)?;
+        return Ok(current.lines().any(|line| line == cli_unix_path_line()));
+    }
+}
+
+fn remove_cli_install_dir_from_path(install_dir: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let current_path = read_windows_user_path()?;
+        let parts = split_windows_path(&current_path)
+            .into_iter()
+            .filter(|part| !windows_path_part_matches(part, install_dir))
+            .collect::<Vec<_>>();
+        write_windows_user_path(&parts.join(";"))?;
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    {
+        let profile_file = cli_profile_file()?;
+        let current = match fs::read_to_string(&profile_file) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        };
+        let path_line = cli_unix_path_line();
+        let next = current
+            .lines()
+            .filter(|line| *line != path_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = if next.is_empty() {
+            String::new()
+        } else {
+            format!("{next}\n")
+        };
+        fs::write(&profile_file, content).map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+}
+
+fn read_text_file_when_present(path: &Path) -> Result<String, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn cli_unix_path_line() -> &'static str {
+    r#"export PATH="$HOME/.local/bin:$PATH""#
+}
+
+#[cfg(windows)]
+fn read_windows_user_path() -> Result<String, String> {
+    read_windows_user_environment_value("Path")
+}
+
+#[cfg(windows)]
+fn write_windows_user_path(value: &str) -> Result<(), String> {
+    let escaped = value.replace('\'', "''");
+    let script = format!("[Environment]::SetEnvironmentVariable('Path', '{escaped}', 'User')");
+    run_powershell_script(&script)
+}
+
+#[cfg(windows)]
+fn read_windows_user_environment_value(name: &str) -> Result<String, String> {
+    let escaped = name.replace('\'', "''");
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &format!("[Environment]::GetEnvironmentVariable('{escaped}', 'User')"),
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_string())
+}
+
+#[cfg(windows)]
+fn split_windows_path(value: &str) -> Vec<String> {
+    value
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[cfg(windows)]
+fn windows_path_parts_contain(parts: &[String], target: &Path) -> bool {
+    parts
+        .iter()
+        .any(|part| windows_path_part_matches(part, target))
+}
+
+#[cfg(windows)]
+fn windows_path_part_matches(part: &str, target: &Path) -> bool {
+    let part = part.trim_end_matches(['\\', '/']);
+    let target = target.display().to_string();
+    let target = target.trim_end_matches(['\\', '/']);
+    part.eq_ignore_ascii_case(target)
+}
+
+fn extract_cli_binary_from_package(
+    target: &FullUpdateTarget,
+    package_path: &Path,
+) -> Result<PathBuf, String> {
+    let extract_dir = std::env::temp_dir()
+        .join("optimuse")
+        .join("cli_update_extract")
+        .join(unique_suffix());
+    fs::create_dir_all(&extract_dir).map_err(|error| error.to_string())?;
+    match target.platform.as_str() {
+        "windows" => extract_cli_binary_from_zip(package_path, &extract_dir),
+        "linux" | "macos" => extract_cli_binary_from_tar_gz(package_path, &extract_dir),
+        other => Err(format!("Unsupported CLI update package platform: {other}")),
+    }
+}
+
+fn extract_cli_binary_from_zip(package_path: &Path, extract_dir: &Path) -> Result<PathBuf, String> {
+    let file = fs::File::open(package_path).map_err(|error| error.to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|error| error.to_string())?;
+    let mut entry = archive.by_name("optimuse.exe").map_err(|error| {
+        format!(
+            "optimuse.exe not found in {}: {error}",
+            package_path.display()
+        )
+    })?;
+    let destination = extract_dir.join("optimuse.exe");
+    let mut output = fs::File::create(&destination).map_err(|error| error.to_string())?;
+    io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+    Ok(destination)
+}
+
+fn extract_cli_binary_from_tar_gz(
+    package_path: &Path,
+    extract_dir: &Path,
+) -> Result<PathBuf, String> {
+    let file = fs::File::open(package_path).map_err(|error| error.to_string())?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = Archive::new(decoder);
+    for entry in archive.entries().map_err(|error| error.to_string())? {
+        let mut entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path().map_err(|error| error.to_string())?;
+        if archive_path_is_exact_file(&path, "optimuse") {
+            let destination = extract_dir.join("optimuse");
+            entry
+                .unpack(&destination)
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&destination)
+                    .map_err(|error| error.to_string())?
+                    .permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&destination, permissions)
+                    .map_err(|error| error.to_string())?;
+            }
+            return Ok(destination);
+        }
+    }
+    Err(format!("optimuse not found in {}", package_path.display()))
+}
+
+fn archive_path_is_exact_file(path: &Path, file_name: &str) -> bool {
+    let mut components = path.components().filter_map(|component| match component {
+        Component::CurDir => None,
+        Component::Normal(value) => Some(value),
+        _ => Some(OsStr::new("")),
+    });
+    let first = components.next();
+    let second = components.next();
+    first == Some(OsStr::new(file_name)) && second.is_none()
+}
+
+fn unique_suffix() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis();
+    format!("{}-{millis}", std::process::id())
+}
+
+#[cfg(windows)]
+fn run_powershell_script(script: &str) -> Result<(), String> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn rewrite_cli_usage_message(message: String) -> String {
+    const ROOT_USAGE_PREFIX: &str = "usage: optimuse ";
+    const CLI_USAGE_PREFIX: &str = "usage: optimuse cli ";
+    if message.starts_with(CLI_USAGE_PREFIX) {
+        return message;
+    }
+    match message.strip_prefix(ROOT_USAGE_PREFIX) {
+        Some(rest) => format!("{CLI_USAGE_PREFIX}{rest}"),
+        None => message,
+    }
+}
+
+async fn run_core_command_and_print(
+    core: &mut crate::core_proxy::CliCore,
+    args: &[String],
+) -> Result<(), String> {
+    let mut commandArgs = args.to_vec();
+    if cli_json_mode() {
+        commandArgs.push("--json".to_string());
+    }
+    let output = core
+        .runCoreCommand(&commandArgs)
+        .await
+        .map_err(core_command_error_message)?;
+    if cli_json_mode() {
+        if !output.stdout.is_empty() {
+            ::std::println!("{}", output.stdout);
+        }
+    } else {
+        if !output.stdout.is_empty() {
+            print!("{}", rewrite_core_command_usage_message(output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", rewrite_core_command_usage_message(output.stderr));
+        }
+    }
+    Ok(())
+}
+
+/// Runs ChatGPT Codex login through the browser callback or the device-code flow.
+async fn run_codex_login_command(
+    core: &mut crate::core_proxy::CliCore,
+    args: &[String],
+) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("browser") => run_codex_browser_login(core).await,
+        Some("device") => run_codex_device_login(core).await,
+        _ => Err("usage: optimuse cli model codex-login <browser|device>".to_string()),
+    }
+}
+
+/// Opens the ChatGPT authorization page and completes login on the fixed Codex callback port.
+async fn run_codex_browser_login(core: &mut crate::core_proxy::CliCore) -> Result<(), String> {
+    let start = core
+        .services_codex_o_auth_service()
+        .startBrowserLogin()
+        .await
+        .map_err(core_command_error_message)?;
+    let listeners = bind_codex_callback_listeners()?;
+    println!("Open this ChatGPT authorization URL:\n{}", start.authorizationUrl);
+    open_local_url(&start.authorizationUrl);
+    let callback = wait_for_codex_callback(&listeners)?;
+    let result = core
+        .services_codex_o_auth_service()
+        .completeBrowserLogin(
+            callback.code,
+            callback.state,
+            start.state,
+            start.codeVerifier,
+        )
+        .await
+        .map_err(core_command_error_message)?;
+    println!(
+        "Codex login successful: {} ({})",
+        result.email, result.accountId
+    );
+    Ok(())
+}
+
+/// Prints a device code and waits until the ChatGPT login is approved.
+async fn run_codex_device_login(core: &mut crate::core_proxy::CliCore) -> Result<(), String> {
+    let start = core
+        .services_codex_o_auth_service()
+        .startDeviceLogin()
+        .await
+        .map_err(core_command_error_message)?;
+    println!("Open {} and enter code {}", start.verificationUrl, start.userCode);
+    open_local_url(&start.verificationUrl);
+    let result = core
+        .services_codex_o_auth_service()
+        .completeDeviceLogin(start)
+        .await
+        .map_err(core_command_error_message)?;
+    println!(
+        "Codex login successful: {} ({})",
+        result.email, result.accountId
+    );
+    Ok(())
+}
+
+struct CodexCallbackQuery {
+    code: String,
+    state: String,
+}
+
+/// Listens on both IPv4 and IPv6 localhost because the registered redirect host is `localhost`.
+fn bind_codex_callback_listeners() -> Result<Vec<std::net::TcpListener>, String> {
+    let mut listeners = Vec::new();
+    let mut errors = Vec::new();
+    for address in ["127.0.0.1:1455", "[::1]:1455"] {
+        match std::net::TcpListener::bind(address) {
+            Ok(listener) => {
+                listener.set_nonblocking(true).map_err(|error| {
+                    format!("Codex callback listener could not configure: {error}")
+                })?;
+                listeners.push(listener);
+            }
+            Err(error) => errors.push(format!("{address}: {error}")),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(format!(
+            "Codex callback listener could not start: {}",
+            errors.join("; ")
+        ));
+    }
+    Ok(listeners)
+}
+
+/// Waits up to five minutes for the fixed Codex browser callback.
+fn wait_for_codex_callback(
+    listeners: &[std::net::TcpListener],
+) -> Result<CodexCallbackQuery, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("Codex authorization callback timed out".to_string());
+        }
+        let mut accepted = None;
+        for listener in listeners {
+            match listener.accept() {
+                Ok(stream) => {
+                    accepted = Some(stream);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let Some((mut stream, _)) = accepted else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        };
+        use std::io::{Read, Write};
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .map_err(|error| error.to_string())?;
+        let mut buffer = [0_u8; 8192];
+        let count = stream.read(&mut buffer).map_err(|error| error.to_string())?;
+        let request = std::str::from_utf8(&buffer[..count]).map_err(|error| error.to_string())?;
+        let target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or_else(|| "Codex callback request has no target".to_string())?;
+        let url = reqwest::Url::parse(&format!("http://127.0.0.1:1455{target}"))
+            .map_err(|error| error.to_string())?;
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<!doctype html><html><body>Codex login complete. You can return to Optimuse.</body></html>";
+        stream.write_all(response.as_bytes()).ok();
+        if url.path() != "/auth/callback" {
+            continue;
+        }
+        let code = url
+            .query_pairs()
+            .find(|(name, _)| name == "code")
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Codex callback did not include an authorization code".to_string())?;
+        let state = url
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .map(|(_, value)| value.into_owned())
+            .ok_or_else(|| "Codex callback did not include state".to_string())?;
+        return Ok(CodexCallbackQuery { code, state });
+    }
+}
+
+/// Opens a local authorization URL when the platform browser command is available.
+fn open_local_url(url: &str) {
+    let result = if cfg!(windows) {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open").arg(url).spawn()
+    } else {
+        Command::new("xdg-open").arg(url).spawn()
+    };
+    if result.is_err() {
+        println!("Could not open a browser. Open the URL manually.");
+    }
+}
+
+/// Runs market commands and lets the CLI own its GitHub login callback process.
+async fn run_market_cli_command(
+    core: &mut crate::core_proxy::CliCore,
+    args: &[String],
+) -> Result<(), String> {
+    if args
+        .iter()
+        .map(String::as_str)
+        .eq(["market", "auth", "login"])
+    {
+        return run_market_auth_login(core).await;
+    }
+    run_core_command_and_print(core, args).await
+}
+
+/// Coordinates the generated Core broker service around the CLI's loopback callback.
+async fn run_market_auth_login(core: &mut crate::core_proxy::CliCore) -> Result<(), String> {
+    let callback = CliOAuthCallback::prepare("https://api.example.com/oauth/github/complete")
+        .map_err(|error| format!("GitHub OAuth callback registration failed: {error}"))?;
+    let start = core
+        .services_git_hub_o_auth_broker_service()
+        .startLogin(callback.completionRedirectUri())
+        .await
+        .map_err(core_command_error_message)?;
+    if cli_json_mode() {
+        eprintln!(
+            "Open this GitHub authorization URL in your browser: {}",
+            start.authorizationUrl
+        );
+    } else {
+        println!(
+            "Open this GitHub authorization URL in your browser:\n{}",
+            start.authorizationUrl
+        );
+    }
+    let completionUrl = callback
+        .waitForCompletion(start.expiresAt)
+        .map_err(|error| format!("GitHub OAuth callback flow failed: {error}"))?;
+    let result = core
+        .services_git_hub_o_auth_broker_service()
+        .completeLogin(GitHubOAuthBrokerLoginCompletion {
+            attemptId: start.attemptId,
+            completionUrl,
+        })
+        .await
+        .map_err(core_command_error_message)?;
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({ "status": "authenticated", "login": result.login }));
+    } else {
+        println!("GitHub login successful: {}", result.login);
+    }
+    Ok(())
+}
+
+/// Runs a local core command and applies local CLI side effects.
+async fn run_local_core_command_and_print(
+    core: &mut crate::core_proxy::CliCore,
+    args: &[String],
+) -> Result<(), String> {
+    let mut commandArgs = args.to_vec();
+    if cli_json_mode() {
+        commandArgs.push("--json".to_string());
+    }
+    let output = core
+        .runCoreCommand(&commandArgs)
+        .await
+        .map_err(core_command_error_message)?;
+    if args.first().map(String::as_str) == Some("storage") {
+        if cli_json_mode() {
+            persist_cli_storage_config_json(&output.stdout)?;
+        } else {
+            persist_cli_storage_config(&output.stdout)?;
+        }
+    }
+    if cli_json_mode() {
+        if !output.stdout.is_empty() {
+            ::std::println!("{}", output.stdout);
+        }
+    } else {
+        if !output.stdout.is_empty() {
+            print!("{}", rewrite_core_command_usage_message(output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", rewrite_core_command_usage_message(output.stderr));
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_core_command_usage_message(message: String) -> String {
+    let ends_with_newline = message.ends_with('\n');
+    let lines = message
+        .lines()
+        .map(rewrite_core_command_usage_line)
+        .collect::<Vec<_>>();
+    let mut rewritten = lines.join("\n");
+    if ends_with_newline {
+        rewritten.push('\n');
+    }
+    rewritten
+}
+
+fn rewrite_core_command_usage_line(line: &str) -> String {
+    const ROOT_COMMAND_PREFIX: &str = "optimuse ";
+    const CLI_COMMAND_PREFIX: &str = "optimuse cli ";
+    if line.starts_with(CLI_COMMAND_PREFIX) {
+        return line.to_string();
+    }
+    match line.strip_prefix(ROOT_COMMAND_PREFIX) {
+        Some(rest) => format!("{CLI_COMMAND_PREFIX}{rest}"),
+        None => rewrite_cli_usage_message(line.to_string()),
+    }
+}
+
+fn core_command_error_message(error: CoreLinkError) -> String {
+    if error.isCommandError() {
+        rewrite_core_command_usage_message(error.message)
+    } else {
+        rewrite_core_command_usage_message(error.to_string())
+    }
+}
+
+async fn run_version_core_command(core: &mut crate::core_proxy::CliCore) -> Result<(), String> {
+    let core_version = core
+        .application()
+        .coreVersion()
+        .await
+        .map_err(|error| error.to_string())?;
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({
+            "cliVersion": env!("CARGO_PKG_VERSION"),
+            "coreVersion": core_version,
+            "linkVersion": optimuse_link::LINK_VERSION,
+            "targetOs": std::env::consts::OS,
+            "targetArch": std::env::consts::ARCH,
+        }));
+    } else {
+        println!("CLI version: {}", env!("CARGO_PKG_VERSION"));
+        println!("Core version: {core_version}");
+        println!("Link version: {}", optimuse_link::LINK_VERSION);
+        println!(
+            "Target: {} {}",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn print_root_usage() {
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({ "usage": "optimuse [tui|cli|install|uninstall]" }));
+        return;
+    }
+    println!("optimuse");
+    println!("optimuse install [--source <path>]");
+    println!("optimuse uninstall");
+    println!("optimuse [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>] [--update-current-version <version>]");
+    println!("optimuse tui [--link-server --link-bind <addr:port> --link-token <token>] [--link-join <session>] [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>] [--update-current-version <version>]");
+    println!("optimuse cli <version|identity|prefs|host|log|local-models|stt|memory|tts|export|import|backup|model|chat|workspace|storage|tag|character|group|active-prompt|approval|tool|market|update|install|uninstall|skill|package|plugin|mcp|link|web|shell>");
+    println!("optimuse cli --link <session> <version|prefs|host|log|local-models|stt|memory|export|import|backup|model|chat|workspace|storage|tag|character|group|active-prompt|approval|tool|market|update|skill|package|plugin|mcp|shell>");
+    println!();
+    print_cli_usage();
+}
+
+/// Prints the complete CLI usage entry point.
+fn print_cli_usage() {
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({ "usage": "optimuse cli <command> [arguments]" }));
+        return;
+    }
+    println!("optimuse cli --link <session> <version|chat|workspace|local-models|stt>");
+    println!("optimuse cli version");
+    print_identity_usage();
+    println!("optimuse cli prefs <show|thinking|thinking-quality|stream|media-history|mcp-timeout>");
+    println!("optimuse cli host <show>");
+    println!("optimuse cli storage <paths|migrate>");
+    println!("optimuse cli log <show|package|path|clear>");
+    println!("optimuse cli local-models <paths|catalog|show|installed|installed-show|install|install-statuses|install-status|install-cancel|verify|delete|engine-delete>");
+    println!(
+        "optimuse cli stt <provider-list|provider-model-list|config|transcribe|transcribe-config>"
+    );
+    println!("optimuse cli memory <character|shared|mount|unmount>");
+    println!("optimuse cli tts config <list|show|current|use|create|update|delete>");
+    println!("optimuse cli tts synthesize --character <id> --text <text>");
+    println!("optimuse cli export <memory|chat|snapshot>");
+    println!("optimuse cli import <memory|chat|snapshot|optimuse1-model-config>");
+    println!("optimuse cli backup <create|restore|inspect|inspect-optimuse1-model-config>");
+    println!("optimuse cli model <init|list|show|set|set-key|api-settings-full|custom-headers|request-queue|api-key-pool|custom-parameters|parameters|builtin-tools|tool-call|direct-image|direct-audio|direct-video|google-search|params|context-show|context-set|summary-show|summary-set|function-list|function-show|function-set|function-reset>");
+    println!("optimuse cli tag <list|show|create|update|delete>");
+    println!("optimuse cli character <init|list|show|create|update|delete|set-active|combine|reset-default>");
+    println!("optimuse cli group <init|list|show|create|update|delete|set-active|duplicate>");
+    println!("optimuse cli active-prompt <show|set-card|set-group|activate-for-chat|resolved-card>");
+    println!("optimuse cli approval <status|list|allow|ask|forbid|tool>");
+    println!("optimuse cli tool <list|show|exec>");
+    println!(
+        "optimuse cli market <auth|rank|list|search|show|comments|comment|like|notifications|my|publish|install|download>"
+    );
+    println!("optimuse cli update [check|target]");
+    println!("optimuse cli usage <summary|records|models|clear>");
+    println!("optimuse cli install [--source <path>]");
+    println!("optimuse cli uninstall");
+    println!("optimuse cli extension <list [kind] [--scope scope]|show <kind> <id>|move <kind> <id> <device|space> --yes>");
+    println!("optimuse cli <plugin|package|skill|mcp> scope <id> [device|space --yes]");
+    println!("optimuse cli skill <dir|list|more|load|show|create|import-zip|delete|visible|errors>");
+    println!("optimuse cli package <help|dir|list|more|load|show|import|enable|disable|use|exec>");
+    println!("optimuse cli plugin <help|list|more|load|show|import|enable|disable>");
+    println!("optimuse cli mcp <dir|list|show|import|export|remove|enable|disable|start|kill|tools|config|config-set|local-set|meta|meta-set|describe>");
+    println!(
+        "optimuse cli link <serve|discover|hello|pair-start|pair-finish|connect|space|sessions|session-delete|accepted-sessions|accepted-session-delete|ping|refresh|stream-probe>"
+    );
+    println!("optimuse cli web open");
+    println!("optimuse cli shell [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
+    println!("optimuse cli chat <new|list|show|current|switch|delete|delete-message|clear|rollback|branch|branches|lock|pin|stats|bind-character|bind-group|set-group|shell|send>");
+    println!("optimuse cli chat new [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
+    println!("optimuse cli chat list");
+    println!("optimuse cli chat show <chat-id> [--runtime]");
+    println!("optimuse cli chat current");
+    println!("optimuse cli chat switch <chat-id>");
+    println!("optimuse cli chat delete <chat-id>");
+    println!("optimuse cli chat delete-message <message-timestamp>");
+    println!("optimuse cli chat clear");
+    println!("optimuse cli chat rollback <message-timestamp>");
+    println!("optimuse cli chat branch [--up-to <message-timestamp>]");
+    println!("optimuse cli chat branches [parent-chat-id]");
+    println!("optimuse cli chat lock <chat-id> <true|false>");
+    println!("optimuse cli chat pin <chat-id> <true|false>");
+    println!("optimuse cli chat stats");
+    println!("optimuse cli chat bind-character <chat-id> <character-card-name>");
+    println!("optimuse cli chat bind-group <chat-id> <character-group-id>");
+    println!("optimuse cli chat set-group <chat-id> <group-name>");
+    println!("optimuse cli chat shell [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
+    println!("optimuse cli chat send [--chat <chat-id>] <message>");
+    println!(
+        "optimuse cli workspace <default-path|create-default|bind-default|bind|unbind|list|chats|commands|commands-path|run|run-path>"
+    );
+    println!("optimuse cli workspace default-path <chat-id>");
+    println!("optimuse cli workspace create-default <chat-id> [project-type]");
+    println!("optimuse cli workspace bind-default <chat-id> [project-type]");
+    println!("optimuse cli workspace bind <chat-id> <workspace>");
+    println!("optimuse cli workspace unbind <chat-id>");
+    println!("optimuse cli workspace list");
+    println!("optimuse cli workspace chats <workspace>");
+    println!("optimuse cli workspace commands <chat-id>");
+    println!("optimuse cli workspace commands-path <workspace>");
+    println!("optimuse cli workspace run <chat-id> <command-id>");
+    println!("optimuse cli workspace run-path <workspace> <command-id>");
+}
+
+/// Prints local identity commands that run before Core startup.
+fn print_identity_usage() {
+    if cli_json_mode() {
+        emit_cli_json(
+            serde_json::json!({ "usage": "optimuse cli identity <list|current|create|use|rename>" }),
+        );
+        return;
+    }
+    println!("optimuse cli identity list");
+    println!("optimuse cli identity current");
+    println!("optimuse cli identity create <name>");
+    println!("optimuse cli identity use <id>");
+    println!("optimuse cli identity rename <id> <name>");
+}
+
+fn print_cli_link_usage() {
+    println!("optimuse cli --link <session> <version|prefs|host|log|local-models|stt|memory|export|import|backup|model|chat|workspace|tag|character|group|active-prompt|approval|tool|market|update|skill|package|plugin|mcp|shell>");
+    println!("optimuse cli link run <session> <version|chat|local-models|stt>");
+}
+
+fn print_model_usage() {
+    println!("optimuse cli model init");
+    println!("optimuse cli model provider-type-list");
+    println!("optimuse cli model provider-list");
+    println!("optimuse cli model provider-show <provider-id>");
+    println!("optimuse cli model codex-login <browser|device>");
+    println!("optimuse cli model provider-create <name> <provider-type-id> <endpoint>");
+    println!("optimuse cli model provider-set-key <provider-id> <api-key>");
+    println!("optimuse cli model provider-set-endpoint <provider-id> <endpoint>");
+    println!("optimuse cli model provider-model-available-list <provider-id> [fetched|all]");
+    println!("optimuse cli model provider-model-add <provider-id> <provider-model-id>");
+    println!("optimuse cli model provider-model-create <provider-id> <provider-model-id>");
+    println!("optimuse cli model list");
+    println!("optimuse cli model show [model-id]");
+    println!("optimuse cli model use <provider-id> <model-id>");
+    println!("optimuse cli model params [model-id]");
+    println!("optimuse cli model parameters <provider-id> <model-id> <parameters-json>");
+    println!("optimuse cli model builtin-tools <provider-id> <model-id> <builtin-tools-json>");
+    println!("optimuse cli model context-show [model-id]");
+    println!("optimuse cli model context-set <provider-id> <model-id> <max-context-length>");
+    println!("optimuse cli model summary-show [model-id]");
+    println!("optimuse cli model summary-set <provider-id> <model-id> <enable-summary> <summary-token-threshold> <enable-summary-by-message-count> <summary-message-count-threshold>");
+    println!("optimuse cli model function-list");
+    println!("optimuse cli model function-show <function-type>");
+    println!("optimuse cli model function-set <function-type> <provider-id> <model-id>");
+    println!("optimuse cli model function-reset [function-type]");
+}
+
+fn print_prefs_usage() {
+    println!("optimuse cli prefs show");
+    println!("optimuse cli prefs thinking <on|off>");
+    println!("optimuse cli prefs thinking-quality <1-4>");
+    println!("optimuse cli prefs stream <on|off>");
+    println!("optimuse cli prefs media-history <image-user-turns> <media-user-turns>");
+    println!("optimuse cli prefs mcp-timeout <seconds>");
+}
+
+fn print_memory_usage() {
+    println!("optimuse cli memory character <character-id> user <show|write|path>");
+    println!(
+        "optimuse cli memory character <character-id> item <list|search|show|create|delete|move>"
+    );
+    println!("optimuse cli memory character <character-id> graph");
+    println!("optimuse cli memory shared <list|create|rename|delete>");
+    println!("optimuse cli memory shared <shared-id> user <show|write|path>");
+    println!("optimuse cli memory shared <shared-id> item <list|search|show|create|delete|move>");
+    println!("optimuse cli memory shared <shared-id> graph");
+    println!("optimuse cli memory mount <character-id> <shared-id> --read <true|false> --write <true|false>");
+    println!("optimuse cli memory unmount <character-id> <shared-id>");
+}
+
+fn print_chat_usage() {
+    println!("optimuse cli chat new [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
+    println!("optimuse cli chat list");
+    println!("optimuse cli chat show <chat-id> [--runtime]");
+    println!("optimuse cli chat current");
+    println!("optimuse cli chat switch <chat-id>");
+    println!("optimuse cli chat delete <chat-id>");
+    println!("optimuse cli chat delete-message <message-timestamp>");
+    println!("optimuse cli chat clear");
+    println!("optimuse cli chat rollback <message-timestamp>");
+    println!("optimuse cli chat branch [--up-to <message-timestamp>]");
+    println!("optimuse cli chat branches [parent-chat-id]");
+    println!("optimuse cli chat lock <chat-id> <true|false>");
+    println!("optimuse cli chat pin <chat-id> <true|false>");
+    println!("optimuse cli chat stats");
+    println!("optimuse cli chat bind-character <chat-id> <character-card-name>");
+    println!("optimuse cli chat bind-group <chat-id> <character-group-id>");
+    println!("optimuse cli chat set-group <chat-id> <group-name>");
+    println!("optimuse cli chat shell [--chat <chat-id>] [--character <character-card-name>] [--group-card <character-group-id>] [--group <group-name>]");
+    println!("optimuse cli chat send [--chat <chat-id>] <message>");
+}
+
+fn print_tag_usage() {
+    println!("optimuse cli tag list");
+    println!("optimuse cli tag show <id>");
+    println!("optimuse cli tag create <name> [prompt-content] [description] [tag-type]");
+    println!("optimuse cli tag update <id> <field> <value>");
+    println!("optimuse cli tag delete <id>");
+}
+
+fn print_character_usage() {
+    println!("optimuse cli character init");
+    println!("optimuse cli character list");
+    println!("optimuse cli character show <id>");
+    println!("optimuse cli character create <name> [character-setting]");
+    println!("optimuse cli character update <id> <field> <value>");
+    println!("optimuse cli character delete <id>");
+    println!("optimuse cli character set-active <id>");
+    println!("optimuse cli character combine <id> [CHAT|VOICE] [tag-id-csv]");
+    println!("optimuse cli character reset-default");
+}
+
+fn print_group_usage() {
+    println!("optimuse cli group init");
+    println!("optimuse cli group list");
+    println!("optimuse cli group show <id>");
+    println!("optimuse cli group create <name> [description]");
+    println!("optimuse cli group update <id> <field> <value>");
+    println!("optimuse cli group delete <id>");
+    println!("optimuse cli group set-active <id>");
+    println!("optimuse cli group duplicate <source-id> [new-name]");
+}
+
+fn print_active_prompt_usage() {
+    println!("optimuse cli active-prompt show");
+    println!("optimuse cli active-prompt set-card <id>");
+    println!("optimuse cli active-prompt set-group <id>");
+    println!(
+        "optimuse cli active-prompt activate-for-chat [character-card-name] [character-group-id]"
+    );
+    println!("optimuse cli active-prompt resolved-card");
+}
+
+fn print_approval_usage() {
+    println!("optimuse cli approval status");
+    println!("optimuse cli approval list");
+    println!("optimuse cli approval allow");
+    println!("optimuse cli approval ask");
+    println!("optimuse cli approval forbid");
+    println!("optimuse cli approval tool <tool-name> <allow|ask|forbid|clear>");
+}
+
+fn print_tool_usage() {
+    println!("optimuse cli tool list <public|internal|all>");
+    println!("optimuse cli tool show <tool-name>");
+    println!("optimuse cli tool exec <tool-name> <params-json>");
+}
+
+fn print_market_usage() {
+    println!("optimuse cli market auth login");
+    println!("optimuse cli market rank [updated|likes|downloads] [page]");
+    println!("optimuse cli market list [updated|likes|downloads] [type|-] [category|-] [page]");
+    println!("optimuse cli market search <query> [updated|likes|downloads] [type|-] [category|-]");
+    println!("optimuse cli market show <entryId>");
+    println!("optimuse cli market install <entryId> [versionId]");
+    println!("optimuse cli market comments <entryId> [page]");
+    println!("optimuse cli market comment <entryId> <body-or-@file>");
+    println!("optimuse cli market comment edit <commentId> <body-or-@file>");
+    println!("optimuse cli market comment delete <commentId>");
+    println!("optimuse cli market like <entryId>");
+    println!("optimuse cli market notifications [limit] [offset]");
+    println!("optimuse cli market my");
+    println!("optimuse cli market publish artifact <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <version> <formatVer> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256>");
+    println!("optimuse cli market publish repo <type> <title> <description-or-@file> <detail-or-@file> <categoryId> <allowPublicUpdates> <sourceUrl> <refType> <refName> <installConfig-or-@file> <version> <formatVer> <changelog-or->");
+    println!("optimuse cli market publish version artifact <entryId> <version> <formatVer> <changelog-or-> <projectId> <runtimePackageId> <assetKind> <assetUrl> <ghOwner> <ghRepo> <ghReleaseTag> <assetName> <sha256> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]");
+    println!("optimuse cli market publish version repo <entryId> <version> <formatVer> <changelog-or-> <refType> <refName> <installConfig-or-@file> [entryTitle|-] [entryDescription-or-] [entryDetail-or-] [entryCategoryId|-] [entryAllowPublicUpdates|-]");
+    println!("optimuse cli market publish update-entry <entryId> <title-or-> <description-or-@file-or-> <detail-or-@file-or-> <categoryId-or-> <allowPublicUpdates-or->");
+    println!("optimuse cli market download <assetId>");
+}
+
+/// Prints update command usage in the selected output format.
+fn print_update_usage() {
+    if cli_json_mode() {
+        emit_cli_json(
+            serde_json::json!({ "usage": "optimuse cli update [check|target|run|download]" }),
+        );
+        return;
+    }
+    println!("optimuse cli update");
+    println!("optimuse cli update check");
+    println!("optimuse cli update target");
+    println!("optimuse cli update run <current-version>");
+    println!("optimuse cli update download <current-version>");
+    println!("optimuse cli update check <current-version>");
+}
+
+/// Prints install command usage in the selected output format.
+fn print_install_usage() {
+    if cli_json_mode() {
+        emit_cli_json(
+            serde_json::json!({ "usage": "optimuse cli install [--source <path>] | status" }),
+        );
+        return;
+    }
+    println!("optimuse install [--source <path>]");
+    println!("optimuse cli install [--source <path>]");
+    println!("optimuse cli install status");
+}
+
+/// Prints uninstall command usage in the selected output format.
+fn print_uninstall_usage() {
+    if cli_json_mode() {
+        emit_cli_json(serde_json::json!({ "usage": "optimuse cli uninstall" }));
+        return;
+    }
+    println!("optimuse uninstall");
+    println!("optimuse cli uninstall");
+}
+
+fn print_skill_usage() {
+    println!("optimuse cli skill dir");
+    println!("optimuse cli skill list");
+    println!("optimuse cli skill more");
+    println!("optimuse cli skill load <name>");
+    println!("optimuse cli skill show <name>");
+    println!(
+        "optimuse cli skill create <skill-id> <description> <content-or-@file> [attachment-path...]"
+    );
+    println!("optimuse cli skill import-zip <zip-path> [sub-dir-in-zip]");
+    println!("optimuse cli skill delete <name>");
+    println!("optimuse cli skill visible <name> [true|false]");
+    println!("optimuse cli skill errors");
+}
+
+fn print_package_usage() {
+    println!("optimuse cli package help");
+    println!("optimuse cli package dir");
+    println!("optimuse cli package list");
+    println!("optimuse cli package more");
+    println!("optimuse cli package load <name>");
+    println!("optimuse cli package show <name>");
+    println!("optimuse cli package import <js-ts-hjson-toolpkg-path>");
+    println!("optimuse cli package enable <name>");
+    println!("optimuse cli package disable <name>");
+    println!("optimuse cli package use <name>");
+    println!("optimuse cli package exec <package:tool> <params-json>");
+}
+
+fn print_plugin_usage() {
+    println!("optimuse cli plugin help");
+    println!("optimuse cli plugin list");
+    println!("optimuse cli plugin more");
+    println!("optimuse cli plugin load <name>");
+    println!("optimuse cli plugin show <name>");
+    println!("optimuse cli plugin import <toolpkg-path>");
+    println!("optimuse cli plugin enable <name>");
+    println!("optimuse cli plugin disable <name>");
+}
+
+fn print_mcp_usage() {
+    println!("optimuse cli mcp dir");
+    println!("optimuse cli mcp list");
+    println!("optimuse cli mcp show <id>");
+    println!("optimuse cli mcp import <json-or-@file>");
+    println!("optimuse cli mcp export");
+    println!("optimuse cli mcp remove <id>");
+    println!("optimuse cli mcp enable <id>");
+    println!("optimuse cli mcp disable <id>");
+    println!("optimuse cli mcp start <id>");
+    println!("optimuse cli mcp kill <id>");
+    println!("optimuse cli mcp tools <id>");
+    println!("optimuse cli mcp config <id>");
+    println!("optimuse cli mcp config-set <id> <json-or-@file>");
+    println!("optimuse cli mcp local-set <id> [--disabled true|false] [--env KEY=VALUE] [--approve TOOL] -- <command> [args...]");
+    println!("optimuse cli mcp meta <id>");
+    println!("optimuse cli mcp meta-set <id> <name> <description-or-@file> <author> <version>");
+    println!("optimuse cli mcp describe <id>");
+}
+
+/// Prints one chat history header for a human reader.
+fn print_chat_history_header(chat: &optimuse_model::ChatHistory::ChatHistory) {
+    println!("Chat {}", chat.id);
+    println!("Title: {}", chat.title);
+    println!("Created: {}", chat.createdAt);
+    println!("Updated: {}", chat.updatedAt);
+    println!("Input tokens: {}", chat.inputTokens);
+    println!("Output tokens: {}", chat.outputTokens);
+    println!("Context window: {}", chat.currentWindowSize);
+    println!("Group: {}", chat.group.clone().unwrap_or_default());
+    println!("Display order: {}", chat.displayOrder);
+    println!(
+        "Workspace: {}",
+        chat.workspacePrimaryPath.clone().unwrap_or_default()
+    );
+    println!(
+        "Parent chat: {}",
+        chat.parentChatId.clone().unwrap_or_default()
+    );
+    println!(
+        "Character: {}",
+        chat.characterCardName.clone().unwrap_or_default()
+    );
+    println!(
+        "Character group: {}",
+        chat.characterGroupId.clone().unwrap_or_default()
+    );
+    println!("Locked: {}", chat.locked);
+    println!("Pinned: {}", chat.pinned);
+}
+
+/// Prints one chat message for a human reader.
+fn print_chat_message(message: &optimuse_model::ChatMessage::ChatMessage) {
+    println!("--- message ---");
+    println!("Sender: {}", message.sender);
+    println!("Timestamp: {}", message.timestamp);
+    println!("Role: {}", message.roleName);
+    println!("Selected variant: {}", message.selectedVariantIndex);
+    println!("Variants: {}", message.variantCount);
+    println!("Provider: {}", message.provider);
+    println!("Model: {}", message.modelName);
+    println!("Input tokens: {}", message.inputTokens);
+    println!("Cached input tokens: {}", message.cachedInputTokens);
+    println!("Output tokens: {}", message.outputTokens);
+    println!("Sent at: {}", message.sentAt);
+    println!("Wait duration: {} ms", message.waitDurationMs);
+    println!("Output duration: {} ms", message.outputDurationMs);
+    println!("Completed at: {}", message.completedAt);
+    println!("Display mode: {:?}", message.displayMode);
+    println!("Favorite: {}", message.isFavorite);
+    println!("Content: {}", message.displayText());
+}
+
+/// Prints one prompt tag for a human reader.
+fn print_tag(tag: &optimuse_model::PromptTag::PromptTag) {
+    println!("Tag {}", tag.id);
+    println!("Name: {}", tag.name);
+    println!("Description: {}", tag.description);
+    println!("Prompt: {}", tag.promptContent);
+    println!("Type: {}", tagTypeName(&tag.tagType));
+    println!("Created: {}", tag.createdAt);
+    println!("Updated: {}", tag.updatedAt);
+}
+
+/// Prints one character card for a human reader.
+fn print_character_card(card: &CharacterCard) {
+    println!("Character {}", card.id);
+    println!("Name: {}", card.name);
+    println!("Description: {}", card.description);
+    println!("Character setting: {}", card.characterSetting);
+    println!("Opening statement: {}", card.openingStatement);
+    println!("Chat content: {}", card.otherContentChat);
+    println!("Voice content: {}", card.otherContentVoice);
+    println!("Tags: {}", card.attachedTagIds.join(","));
+    println!("Advanced prompt: {}", card.advancedCustomPrompt);
+    println!("Marks: {}", card.marks);
+    println!("Chat model binding: {}", card.chatModelBindingMode);
+    println!(
+        "Chat model: {}",
+        card.chatModelId.clone().unwrap_or_default()
+    );
+    println!(
+        "TTS config: {}",
+        card.ttsConfigId.clone().unwrap_or_default()
+    );
+    println!(
+        "Shared memory mounts: {}",
+        serde_json::to_string(&card.sharedMemoryMounts).expect("sharedMemoryMounts must serialize")
+    );
+    println!(
+        "Tool access: {}",
+        serde_json::to_string(&card.toolAccessConfig).expect("toolAccessConfig must serialize")
+    );
+    println!("Default: {}", card.isDefault);
+    println!("Created: {}", card.createdAt);
+    println!("Updated: {}", card.updatedAt);
+}
+
+/// Prints one character group card for a human reader.
+fn print_character_group_card(group: &CharacterGroupCard) {
+    println!("Character group {}", group.id);
+    println!("Name: {}", group.name);
+    println!("Description: {}", group.description);
+    println!(
+        "Members: {}",
+        group
+            .members
+            .iter()
+            .map(|member| format!("{}:{}", member.characterCardId, member.orderIndex))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    println!("Created: {}", group.createdAt);
+    println!("Updated: {}", group.updatedAt);
+}
+
+fn parse_group_members(value: &str) -> Vec<GroupMemberConfig> {
+    let mut result = Vec::new();
+    for (index, item) in value.split(',').enumerate() {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        result.push(GroupMemberConfig {
+            characterCardId: trimmed.to_string(),
+            orderIndex: index as i32,
+        });
+    }
+    result
+}
+
+fn parseTagType(value: Option<&str>) -> Result<TagType, String> {
+    match value.unwrap_or("CUSTOM") {
+        "TONE" => Ok(TagType::TONE),
+        "CHARACTER" => Ok(TagType::CHARACTER),
+        "FUNCTION" => Ok(TagType::FUNCTION),
+        "CUSTOM" => Ok(TagType::CUSTOM),
+        other => Err(format!(
+            "invalid tagType: {other}; expected TONE | CHARACTER | FUNCTION | CUSTOM"
+        )),
+    }
+}
+
+fn parse_permission_level_arg(value: Option<&str>) -> Result<AiPermissionMode, String> {
+    match value {
+        Some("allow") | Some("ALLOW") => Ok(AiPermissionMode::Full),
+        Some("ask") | Some("ASK") => Ok(AiPermissionMode::WorkspaceWrite),
+        Some("forbid") | Some("FORBID") => Ok(AiPermissionMode::ReadOnly),
+        _ => Err("expected allow, ask, or forbid".to_string()),
+    }
+}
+
+fn tagTypeName(tagType: &TagType) -> &'static str {
+    match tagType {
+        TagType::TONE => "TONE",
+        TagType::CHARACTER => "CHARACTER",
+        TagType::FUNCTION => "FUNCTION",
+        TagType::CUSTOM => "CUSTOM",
+    }
+}
+
+fn parsePromptFunctionType(value: Option<&str>) -> Result<PromptFunctionType, String> {
+    match value.unwrap_or("CHAT") {
+        "CHAT" => Ok(PromptFunctionType::CHAT),
+        "VOICE" => Ok(PromptFunctionType::VOICE),
+        other => Err(format!(
+            "invalid promptFunctionType: {other}; expected CHAT | VOICE"
+        )),
+    }
+}
+
+fn parseFunctionType(value: &str) -> Result<FunctionType, String> {
+    match value {
+        "CHAT" => Ok(FunctionType::CHAT),
+        "SUMMARY" => Ok(FunctionType::SUMMARY),
+        "MEMORY" => Ok(FunctionType::MEMORY),
+        "UI_CONTROLLER" => Ok(FunctionType::UI_CONTROLLER),
+        "TRANSLATION" => Ok(FunctionType::TRANSLATION),
+        "GREP" => Ok(FunctionType::GREP),
+        "ROLE_RESPONSE_PLANNER" => Ok(FunctionType::ROLE_RESPONSE_PLANNER),
+        "IMAGE_RECOGNITION" => Ok(FunctionType::IMAGE_RECOGNITION),
+        "AUDIO_RECOGNITION" => Ok(FunctionType::AUDIO_RECOGNITION),
+        "VIDEO_RECOGNITION" => Ok(FunctionType::VIDEO_RECOGNITION),
+        other => Err(format!("invalid FunctionType: {other}")),
+    }
+}
+
+fn parse_f32_arg(value: Option<&String>, usage: &str) -> Result<f32, String> {
+    value
+        .ok_or_else(|| usage.to_string())?
+        .parse::<f32>()
+        .map_err(|error| error.to_string())
+}
+
+fn parse_i32_arg(value: Option<&String>, usage: &str) -> Result<i32, String> {
+    value
+        .ok_or_else(|| usage.to_string())?
+        .parse::<i32>()
+        .map_err(|error| error.to_string())
+}
+
+fn parse_optional_i32_arg(value: Option<&String>, defaultValue: i32) -> Result<i32, String> {
+    match value {
+        Some(value) => value.parse::<i32>().map_err(|error| error.to_string()),
+        None => Ok(defaultValue),
+    }
+}
+
+fn parse_i64_arg(value: Option<&String>, usage: &str) -> Result<i64, String> {
+    value
+        .ok_or_else(|| usage.to_string())?
+        .parse::<i64>()
+        .map_err(|error| error.to_string())
+}
+
+fn parse_bool_arg(value: Option<&String>, usage: &str) -> Result<bool, String> {
+    match value.ok_or_else(|| usage.to_string())?.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("invalid bool: {other}; expected true | false")),
+    }
+}
+
+fn parse_on_off_arg(value: Option<&String>, usage: &str) -> Result<bool, String> {
+    match value.ok_or_else(|| usage.to_string())?.as_str() {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("invalid switch: {other}; expected on | off")),
+    }
+}
+
+fn parseApiProviderType(value: &str) -> Result<ApiProviderType, String> {
+    ApiProviderType::fromProviderTypeId(value)
+        .ok_or_else(|| format!("invalid ApiProviderType: {value}"))
+}
+
+fn functionTypeName(functionType: &FunctionType) -> &'static str {
+    match functionType {
+        FunctionType::CHAT => "CHAT",
+        FunctionType::SUMMARY => "SUMMARY",
+        FunctionType::MEMORY => "MEMORY",
+        FunctionType::UI_CONTROLLER => "UI_CONTROLLER",
+        FunctionType::TRANSLATION => "TRANSLATION",
+        FunctionType::TITLE_GENERATION => "TITLE_GENERATION",
+        FunctionType::GREP => "GREP",
+        FunctionType::ROLE_RESPONSE_PLANNER => "ROLE_RESPONSE_PLANNER",
+        FunctionType::IMAGE_RECOGNITION => "IMAGE_RECOGNITION",
+        FunctionType::AUDIO_RECOGNITION => "AUDIO_RECOGNITION",
+        FunctionType::VIDEO_RECOGNITION => "VIDEO_RECOGNITION",
+    }
+}
+
+fn parseCsvList(value: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for item in value.split(',') {
+        let trimmed = item.trim();
+        if !trimmed.is_empty() && !result.iter().any(|entry| entry == trimmed) {
+            result.push(trimmed.to_string());
+        }
+    }
+    result
+}
+
+/// Prints one memory in compact human-readable list form.
+fn print_memory_item_line(memory: &optimuse_model::Memory::Memory) {
+    println!(
+        "{}\t{}\t{}\t{}",
+        memory.id,
+        memory.title,
+        memory.folderPath.clone().unwrap_or_else(String::new),
+        memory
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
+/// Prints one memory with labeled fields for a human reader.
+fn print_memory_item(memory: &optimuse_model::Memory::Memory) {
+    println!("Memory {}", memory.id);
+    println!("UUID: {}", memory.uuid);
+    println!("Title: {}", memory.title);
+    println!("Content: {}", memory.content);
+    println!("Content type: {}", memory.contentType);
+    println!("Source: {}", memory.source);
+    println!("Credibility: {}", memory.credibility);
+    println!("Importance: {}", memory.importance);
+    println!(
+        "Folder: {}",
+        memory.folderPath.clone().unwrap_or_else(String::new)
+    );
+    println!("Created: {}", memory.createdAt);
+    println!("Updated: {}", memory.updatedAt);
+    println!("Last accessed: {}", memory.lastAccessedAt);
+    println!(
+        "Tags: {}",
+        memory
+            .tags
+            .iter()
+            .map(|tag| tag.name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+}
+
+/// Returns a trimmed string only when the value is non-empty.
+fn nonBlankString(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[allow(non_snake_case)]
+fn currentTimeMillis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after unix epoch")
+        .as_millis() as i64
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies CLI errors expose the denied route subject and capability.
+    #[test]
+    fn cli_route_permission_error_keeps_structured_diagnostics() {
+        let error = CoreLinkError::withDetails(
+            "ROUTE_PERMISSION_DENIED",
+            "Space route chatMessagesFlow requires capability chat.read on caller cli-client",
+            optimuse_link::CoreValue::Map(BTreeMap::from([
+                (
+                    "subject".to_string(),
+                    optimuse_link::CoreValue::String("caller".to_string()),
+                ),
+                (
+                    "requiredCapability".to_string(),
+                    optimuse_link::CoreValue::String("chat.read".to_string()),
+                ),
+                (
+                    "callerNodeId".to_string(),
+                    optimuse_link::CoreValue::String("cli-client".to_string()),
+                ),
+                (
+                    "targetNodeId".to_string(),
+                    optimuse_link::CoreValue::String("windows-owner".to_string()),
+                ),
+            ])),
+        );
+        let message = core_command_error_message(error);
+        assert!(message.contains("ROUTE_PERMISSION_DENIED"));
+        assert!(message.contains("caller"));
+        assert!(message.contains("chat.read"));
+        assert!(message.contains("cli-client"));
+        assert!(message.contains("windows-owner"));
+    }
+}

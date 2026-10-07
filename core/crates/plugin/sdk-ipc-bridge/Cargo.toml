@@ -1,0 +1,11 @@
+[package]
+name = "optimuse-plugin-sdk-ipc-bridge"
+version = "2.0.0-preview.14"
+edition.workspace = true
+publish = false
+description = "Optimuse-host bridge between Plugin SDK IPC and the existing tool runtime."
+
+[dependencies]
+optimuse-host-api = { path = "../../foundation/host-api" }
+optimuse-link = { path = "../../foundation/link" }
+optimuse-plugin-sdk-ipc = { path = "../sdk-ipc" }

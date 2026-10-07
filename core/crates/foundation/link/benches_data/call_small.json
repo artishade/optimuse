@@ -1,0 +1,12 @@
+{
+  "request": {
+    "requestId": "bench-small-call",
+    "target": "core/test",
+    "methodName": "send",
+    "args": {
+      "message": "ping",
+      "stream": false
+    }
+  }
+}
+

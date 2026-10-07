@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+repo_root="$PROJECT_DIR/../../../.."
+crate_dir="$repo_root/apps/flutter/native/optimuse-flutter-bridge"
+out_dir="$PROJECT_DIR/Flutter/ephemeral/rust"
+lib_name="liboptimuse_flutter_bridge.a"
+
+# Core embeds plugin assets at compile time. Prepare both built-in and optional
+# official packages before Cargo runs, including on the first clean build.
+"$repo_root/.venv/bin/python" "$repo_root/plugins/tools/sync_plugin_packages.py" \
+  --source runtime --no-hot-reload
+
+for arch in $ARCHS; do
+  case "$arch" in
+    arm64)
+      rust_target="aarch64-apple-darwin"
+      ;;
+    x86_64)
+      rust_target="x86_64-apple-darwin"
+      ;;
+    *)
+      echo "Unsupported macOS Rust bridge architecture: $arch" >&2
+      exit 1
+      ;;
+  esac
+
+  mkdir -p "$out_dir/$arch"
+  rustup target add "$rust_target"
+
+  RUSTFLAGS="-Awarnings" cargo rustc \
+    --manifest-path "$crate_dir/Cargo.toml" \
+    --release \
+    --target "$rust_target" \
+    --crate-type staticlib
+
+  cp "$crate_dir/target/$rust_target/release/$lib_name" "$out_dir/$arch/$lib_name"
+done

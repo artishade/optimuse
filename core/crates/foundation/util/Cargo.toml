@@ -1,0 +1,21 @@
+[package]
+name = "optimuse-util"
+version = "2.0.0-preview.14"
+edition.workspace = true
+license.workspace = true
+publish = true
+description = "Shared utility services and stream primitives for Optimuse."
+readme = "README.md"
+repository = "https://github.com/example/Optimuse"
+documentation = "https://docs.rs/optimuse-util"
+
+[dependencies]
+optimuse-host-api = { version = "0.1.0", path = "../host-api" }
+chrono.workspace = true
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+zip.workspace = true

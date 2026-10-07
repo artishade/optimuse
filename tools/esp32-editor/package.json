@@ -1,0 +1,16 @@
+{
+  "name": "optimuse-esp32-editor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types src/server.mts",
+    "build": "node --experimental-strip-types src/build.mts",
+    "build:firmware": "node --experimental-strip-types src/build.mts --firmware",
+    "test": "node --test --experimental-strip-types tests/*.test.mjs",
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "typescript": "5.9.3"
+  }
+}

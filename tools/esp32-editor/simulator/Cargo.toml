@@ -1,0 +1,23 @@
+[package]
+name = "optimuse-esp32-simulator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+optimuse-node-runtime = { path = "../../../core/crates/node/runtime", default-features = false }
+optimuse-host-native-common = { path = "../../../hosts/common/optimuse-host-native-common", features = ["tcp"] }
+optimuse-host-native-scheduler = { path = "../../../hosts/common/optimuse-host-native-scheduler", default-features = false }
+optimuse-peer-link = { path = "../../../core/crates/node/peer-link" }
+optimuse-edge-contract = { path = "../../../core/crates/node/edge-contract" }
+async-trait = "0.1"
+log = "0.4"
+base64 = "0.22"
+optimuse-host-api = { path = "../../../core/crates/foundation/host-api" }
+optimuse-link = { path = "../../../core/crates/foundation/link" }
+optimuse-node-edge = { path = "../../../core/crates/node/edge" }
+mdns-sd = "0.12"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "net", "sync", "time", "io-util", "io-std"] }

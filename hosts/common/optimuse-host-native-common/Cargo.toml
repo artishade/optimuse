@@ -1,0 +1,33 @@
+[package]
+name = "optimuse-host-native-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+fs = ["dep:optimuse-host-native-filesystem"]
+http = ["dep:optimuse-host-native-http"]
+scheduler = ["dep:optimuse-host-native-scheduler"]
+storage = ["dep:optimuse-host-native-storage"]
+terminal = ["dep:optimuse-host-native-terminal"]
+tcp = ["dep:async-trait", "dep:tokio"]
+serial = ["dep:async-trait", "dep:tokio", "dep:tokio-serial"]
+
+[dependencies]
+optimuse-host-api = { path = "../../../core/crates/foundation/host-api" }
+optimuse-host-native-filesystem = { path = "../optimuse-host-native-filesystem", optional = true }
+optimuse-host-native-http = { path = "../optimuse-host-native-http", optional = true }
+optimuse-host-native-scheduler = { path = "../optimuse-host-native-scheduler", optional = true }
+optimuse-host-native-storage = { path = "../optimuse-host-native-storage", optional = true }
+optimuse-host-native-terminal = { path = "../optimuse-host-native-terminal", optional = true }
+
+[target.'cfg(not(any(target_os = "ios", target_os = "espidf", target_arch = "wasm32")))'.dependencies]
+tokio-serial = { version = "5", optional = true }
+[target.'cfg(not(any(target_os = "espidf", target_arch = "wasm32")))'.dependencies]
+async-trait = { version = "0.1", optional = true }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "net", "sync"], optional = true }
+
+
+mdns-sd = "0.12"

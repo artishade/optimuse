@@ -1,0 +1,546 @@
+#![allow(non_snake_case)]
+
+extern crate self as optimuse_proxy_local;
+
+use async_trait::async_trait;
+use optimuse_host_api::HostManager::HostManager;
+use optimuse_host_api::{FileSystemHost, RuntimeStorageHost};
+use optimuse_link::{
+    CoreCallRequest, CoreCallResponse, CoreEvent, CoreEventKind, CoreEventStream, CoreLinkClient,
+    CoreLinkError, CoreLinkPushSession, CoreLinkSharedClient, CoreValue, CoreWatchRequest,
+};
+use optimuse_proxy_bridge::{LocalApplicationBridgeTarget, LocalApplicationSharedClient};
+pub use optimuse_rslink_runtime::{CoreReverseStreamSession, CoreStreamPool};
+use optimuse_runtime::core::application::OptimuseApplication::OptimuseApplication;
+use optimuse_runtime::core::chat::ChatRuntimeHolder::ChatRuntimeHolder;
+use optimuse_tools::runtime_support::{
+    CoreNodeToolRuntime, CoreRouteChangeHandler, ToolRuntimeSupport,
+};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+include!(concat!(env!("OUT_DIR"), "/generated_core_dispatch.rs"));
+
+mod generated_plugin_sdk_surface {
+    include!(concat!(env!("OUT_DIR"), "/plugin_sdk_surface.rs"));
+}
+
+/// Returns the SDK route surface generated from explicit source annotations.
+pub fn pluginSdkSurface() -> optimuse_plugin_sdk_ipc::PluginSdkSurface {
+    generated_plugin_sdk_surface::pluginSdkSurface()
+}
+
+#[derive(Clone)]
+pub struct LocalCoreProxy {
+    peerServices: Arc<std::sync::OnceLock<optimuse_node_runtime::NodeServices::NodeServices>>,
+    application: Arc<Mutex<OptimuseApplication>>,
+    // Retains the shared command view; its executor holds only a Weak reference.
+    #[cfg(not(target_arch = "wasm32"))]
+    _coreCommandRuntime: Option<Arc<OptimuseApplication>>,
+    chatRuntimeHolder: Arc<tokio::sync::Mutex<ChatRuntimeHolder>>,
+    hostManager: HostManager,
+    toolRuntimeSupport: Arc<dyn ToolRuntimeSupport>,
+    coreStreamPool: Arc<CoreStreamPool>,
+}
+
+impl LocalCoreProxy {
+    /// Creates the attachment sink used by generated Flow and State watchers.
+    fn streamAttachmentAdopter(
+        &self,
+    ) -> Arc<dyn Fn(Vec<optimuse_link::CoreStreamAttachment>) + Send + Sync> {
+        let pool = self.coreStreamPool.clone();
+        Arc::new(move |attachments| {
+            pool.adoptAll(attachments);
+        })
+    }
+
+    /// Returns the host manager captured by this local proxy.
+    pub fn hostManager(&self) -> &HostManager {
+        &self.hostManager
+    }
+    /// Resolves one generated schema key to its stable string target.
+    #[allow(non_snake_case)]
+    pub fn generatedTargetForSchema(schema: &str) -> Option<&'static str> {
+        generated_target_for_schema(schema)
+    }
+
+    /// Returns the generated local object ID for one concrete runtime type.
+    pub fn generatedTargetForType(typeName: &str) -> Option<&'static str> {
+        generated_target_for_type(typeName)
+    }
+
+    /// Installs the server-side CoreNode tool capability without taking the application dispatch lock.
+    #[allow(non_snake_case)]
+    pub fn bindCoreNodeToolRuntime(
+        &self,
+        runtime: Arc<dyn CoreNodeToolRuntime>,
+    ) -> Result<(), CoreLinkError> {
+        self.toolRuntimeSupport
+            .bindCoreNodeToolRuntime(runtime)
+            .map_err(CoreLinkError::internal)
+    }
+
+    /// Installs the route change controller used after a completed AI turn.
+    #[allow(non_snake_case)]
+    pub fn bindCoreRouteChangeHandler(
+        &self,
+        handler: CoreRouteChangeHandler,
+    ) -> Result<(), String> {
+        self.toolRuntimeSupport.bindCoreRouteChangeHandler(handler)
+    }
+
+    /// Opens one caller-owned input stream directly on this local Core proxy.
+    #[allow(non_snake_case)]
+    pub fn openPushLocal(
+        &self,
+        request: optimuse_link::CorePushRequest,
+    ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
+        Ok(Box::new(self.openReverseStream(request)?))
+    }
+
+    /// Reports whether a push request is a generated reverse-stream method.
+    #[allow(non_snake_case)]
+    pub fn isReverseStreamRequest(&self, request: &optimuse_link::CorePushRequest) -> bool {
+        generated_is_reverse_stream_request(request)
+    }
+    /// Opens one generated reverse stream selected by its proxy schema declaration.
+    #[allow(non_snake_case)]
+    pub fn openReverseStream(
+        &self,
+        request: optimuse_link::CorePushRequest,
+    ) -> Result<CoreReverseStreamSession, CoreLinkError> {
+        generated_open_reverse_stream(self, request)
+    }
+    /// Creates a local link client backed by an in-process application.
+    pub fn new(#[allow(unused_mut)] mut application: OptimuseApplication) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let coreCommandRuntime = Self::installCoreCommandExecutor(&mut application);
+        let toolRuntimeSupport = application.toolHandler.runtimeSupport();
+        let chatRuntimeHolder = application.chatRuntimeHolder.clone();
+        Self {
+            peerServices: Arc::new(std::sync::OnceLock::new()),
+            hostManager: application.hostManager.clone(),
+            toolRuntimeSupport,
+            application: Arc::new(Mutex::new(application)),
+            #[cfg(not(target_arch = "wasm32"))]
+            _coreCommandRuntime: coreCommandRuntime,
+            chatRuntimeHolder,
+            coreStreamPool: Arc::new(CoreStreamPool::new()),
+        }
+    }
+
+    /// Binds plugin CLI calls to this application's live services, including Flutter hosts.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn installCoreCommandExecutor(
+        application: &mut OptimuseApplication,
+    ) -> Option<Arc<OptimuseApplication>> {
+        if application.hostManager.coreCommandExecutor.is_some() {
+            return None;
+        }
+        Some(Arc::new_cyclic(
+            |runtime: &std::sync::Weak<OptimuseApplication>| {
+                let runtime = runtime.clone();
+                let executor: optimuse_host_api::HostManager::CoreCommandExecutor =
+                    Arc::new(move |args| {
+                        let runtime = runtime.clone();
+                        Box::pin(async move {
+                            let runtime = runtime.upgrade().ok_or_else(|| {
+                                "Core command runtime has been released.".to_string()
+                            })?;
+                            let scheduler = runtime
+                                .hostManager
+                                .hostRuntimeTaskSchedulerHost
+                                .clone()
+                                .ok_or_else(|| {
+                                    "Core command execution requires a task scheduler host."
+                                        .to_string()
+                                })?;
+                            let mut commandApplication = runtime.sharedCoreCommandRuntime();
+                            let (sender, receiver) = tokio::sync::oneshot::channel();
+                            scheduler
+                                .scheduleHostRuntimeAsyncTask(
+                                    "core-tool-command",
+                                    Box::new(move || {
+                                        Box::pin(async move {
+                                            let result = optimuse_command_core::run_core_command(
+                                                &mut commandApplication,
+                                                &args,
+                                            )
+                                            .await
+                                            .map(|output| {
+                                                format!("{}{}", output.stdout, output.stderr)
+                                            });
+                                            let _ = sender.send(result);
+                                        })
+                                    }),
+                                )
+                                .map_err(|error| error.message)?;
+                            receiver
+                                .await
+                                .map_err(|error| format!("Core command task stopped: {error}"))?
+                        })
+                    });
+                application.hostManager.coreCommandExecutor = Some(executor.clone());
+                application.toolHandler.setCoreCommandExecutor(executor);
+                application.sharedCoreCommandRuntime()
+            },
+        ))
+    }
+
+    /// Returns mutable access to the hosted local application.
+    #[allow(non_snake_case)]
+    pub fn localApplicationMut(&mut self) -> &mut OptimuseApplication {
+        Arc::get_mut(&mut self.application)
+            .expect("LocalCoreProxy application must not be shared while mutating setup")
+            .get_mut()
+    }
+
+    /// Returns the runtime storage capability owned by this local core.
+    #[allow(non_snake_case)]
+    pub fn runtimeStorageHost(&self) -> Arc<dyn RuntimeStorageHost> {
+        self.hostManager
+            .runtimeStorageHost
+            .clone()
+            .expect("LocalCoreProxy requires a RuntimeStorageHost")
+    }
+
+    /// Returns the runtime holder used by generated local server dispatch.
+    pub fn chatRuntimeHolder(&self) -> Arc<tokio::sync::Mutex<ChatRuntimeHolder>> {
+        self.chatRuntimeHolder.clone()
+    }
+
+    /// Creates the server-internal client that dispatches only to the local application object.
+    #[allow(non_snake_case)]
+    pub fn localApplicationSharedClient(&self) -> Arc<dyn CoreLinkSharedClient + Send + Sync> {
+        Arc::new(LocalApplicationSharedClient::new(Arc::new(self.clone()), "core/application"))
+    }
+
+    /// Builds the shared node capability container over this Core's Host APIs.
+    pub fn coreNodeLocalRuntime(
+        &self,
+    ) -> optimuse_node_runtime::CoreNodeRouter::CoreNodeLocalRuntime {
+        let proxy = Arc::new(self.clone());
+        let spaceRuntime = Arc::new(optimuse_node_runtime::SpaceRuntime::SpaceRuntime::new(
+            self.chatRuntimeHolder(),
+        ));
+        let sharedClient: Arc<dyn CoreLinkSharedClient + Send + Sync> = proxy.clone();
+        let applicationClient = self.localApplicationSharedClient();
+        let bindCoreNodeToolRuntime = {
+            let proxy = proxy.clone();
+            Arc::new(move |runtime| proxy.bindCoreNodeToolRuntime(runtime))
+        };
+        let openPush = {
+            let proxy = proxy.clone();
+            Arc::new(move |request| proxy.openPushLocal(request))
+        };
+        optimuse_node_runtime::CoreNodeRouter::CoreNodeLocalRuntime::new(
+            sharedClient,
+            applicationClient,
+            self.runtimeStorageHost(),
+            Arc::new(LocalCoreProxy::generatedTargetForSchema),
+            bindCoreNodeToolRuntime,
+            openPush,
+            spaceRuntime,
+        ).withPeerServices(self.peerServices.clone())
+    }
+
+    /// Returns the file-system capability owned by this local core.
+    #[allow(non_snake_case)]
+    pub fn fileSystemHost(&self) -> Arc<dyn FileSystemHost> {
+        self.hostManager
+            .fileSystemHost
+            .clone()
+            .expect("LocalCoreProxy requires a FileSystemHost")
+    }
+}
+
+#[async_trait(?Send)]
+impl CoreLinkClient for LocalCoreProxy {
+    async fn call(&mut self, request: CoreCallRequest) -> CoreCallResponse {
+        CoreLinkSharedClient::call(self, request).await
+    }
+
+    #[allow(non_snake_case)]
+    async fn watchSnapshot(
+        &mut self,
+        request: CoreWatchRequest,
+    ) -> Result<CoreEvent, CoreLinkError> {
+        CoreLinkSharedClient::watchSnapshot(self, request).await
+    }
+
+    async fn watch(&mut self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        CoreLinkSharedClient::watch(self, request).await
+    }
+
+    #[allow(non_snake_case)]
+    async fn openPush(
+        &mut self,
+        request: optimuse_link::CorePushRequest,
+    ) -> Result<Box<dyn CoreLinkPushSession>, CoreLinkError> {
+        self.openPushLocal(request)
+    }
+}
+
+#[async_trait(?Send)]
+impl CoreLinkSharedClient for LocalCoreProxy {
+    async fn call(&self, request: CoreCallRequest) -> CoreCallResponse {
+        let requestId = request.requestId.clone();
+        let result = self.dispatchCall(request).await;
+        match result {
+            Ok(value) => CoreCallResponse::ok(requestId, value),
+            Err(error) => CoreCallResponse::err(requestId, error),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    async fn watchSnapshot(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        let context = format!(
+            "watchSnapshot request={} object={} property={}",
+            request.requestId.0, request.target, request.propertyName
+        );
+        let (result, attachments) = optimuse_link::withCoreStreamCapture(
+            generated_dispatch_core_proxy_watch_snapshot_async(self, request),
+        )
+        .await;
+        self.adoptCoreStreamAttachments(attachments);
+        result.map_err(|mut error| {
+            error.message = format!("{} [{context}]", error.message);
+            error
+        })
+    }
+
+    async fn watch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        if request.target == optimuse_link::CORE_STREAM_TARGET {
+            return self.openCoreStreamWatch(request);
+        }
+        let context = format!(
+            "watch request={} object={} property={}",
+            request.requestId.0, request.target, request.propertyName
+        );
+        generated_dispatch_core_proxy_watch_async(self, request)
+            .await
+            .map_err(|mut error| {
+                error.message = format!("{} [{context}]", error.message);
+                error
+            })
+    }
+}
+
+#[async_trait(?Send)]
+impl LocalApplicationBridgeTarget for LocalCoreProxy {
+    /// Dispatches one application-owned call without re-entering server service objects.
+    async fn callLocalApplication(&self, request: CoreCallRequest) -> CoreCallResponse {
+        let requestId = request.requestId.clone();
+        let result = self.dispatchCall(request).await;
+        match result {
+            Ok(value) => CoreCallResponse::ok(requestId, value),
+            Err(error) => CoreCallResponse::err(requestId, error),
+        }
+    }
+
+    /// Reads one application-owned watch snapshot without entering the proxy dispatcher.
+    #[allow(non_snake_case)]
+    async fn watchLocalApplicationSnapshot(
+        &self,
+        request: CoreWatchRequest,
+    ) -> Result<CoreEvent, CoreLinkError> {
+        let propertyName = request.propertyName.clone();
+        let target = request.target.clone();
+        let mut application = self.application.lock().await;
+        let value = generated_dispatch_application_watch_snapshot(&mut application, &request)?;
+        Ok(CoreEvent {
+            requestId: Some(request.requestId),
+            target,
+            propertyName,
+            kind: CoreEventKind::Snapshot,
+            value,
+        })
+    }
+
+    /// Opens one application-owned watch without entering the proxy dispatcher.
+    async fn watchLocalApplication(
+        &self,
+        request: CoreWatchRequest,
+    ) -> Result<CoreEventStream, CoreLinkError> {
+        let mut application = self.application.lock().await;
+        generated_dispatch_application_watch(
+            &mut application,
+            request,
+            self.streamAttachmentAdopter(),
+        )
+    }
+}
+
+impl LocalCoreProxy {
+    #[allow(non_snake_case)]
+    async fn dispatchCall(&self, request: CoreCallRequest) -> Result<CoreValue, CoreLinkError> {
+        let (result, attachments) =
+            optimuse_link::withCoreStreamCapture(generated_dispatch_core_proxy_call(self, request))
+                .await;
+        self.adoptCoreStreamAttachments(attachments);
+        result
+    }
+
+    /// Executes a watch snapshot through the generated synchronous dispatcher.
+    #[allow(non_snake_case)]
+    pub fn watchSnapshotSync(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        self.dispatchWatchSnapshot(request)
+    }
+
+    /// Opens a watch stream through the generated synchronous dispatcher.
+    #[allow(non_snake_case)]
+    pub fn watchSync(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        self.dispatchWatch(request)
+    }
+
+    #[allow(non_snake_case)]
+    fn dispatchWatchSnapshot(&self, request: CoreWatchRequest) -> Result<CoreEvent, CoreLinkError> {
+        let (result, attachments) = optimuse_link::withCoreStreamCaptureSync(|| {
+            generated_dispatch_core_proxy_watch_snapshot(self, request)
+        });
+        self.adoptCoreStreamAttachments(attachments);
+        result
+    }
+
+    #[allow(non_snake_case)]
+    fn dispatchWatch(&self, request: CoreWatchRequest) -> Result<CoreEventStream, CoreLinkError> {
+        if request.target == optimuse_link::CORE_STREAM_TARGET {
+            return self.openCoreStreamWatch(request);
+        }
+        generated_dispatch_core_proxy_watch(self, request)
+    }
+
+    /// Transfers serialized stream sources into this proxy's owned pool.
+    fn adoptCoreStreamAttachments(&self, attachments: Vec<optimuse_link::CoreStreamAttachment>) {
+        self.coreStreamPool.adoptAll(attachments);
+    }
+
+    /// Opens one anonymous stream source from the proxy-owned stream pool.
+    fn openCoreStreamWatch(
+        &self,
+        request: CoreWatchRequest,
+    ) -> Result<CoreEventStream, CoreLinkError> {
+        self.coreStreamPool.openCoreStreamWatch(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use optimuse_host_api::HostManager::HostManager;
+    use optimuse_host_native_common::{
+        NativeHostJavaScriptRuntimeHost, NativeHostRuntimeTaskSchedulerHost,
+        NativeRuntimeStorageHost, PosixFileSystemHost,
+    };
+    use optimuse_link::{
+        CoreEventKind, CoreStreamAttachment, CoreStreamSource, CORE_STREAM_TARGET,
+    };
+    use optimuse_util::RuntimeStorageLayout::{RUNTIME_ROOT_DIR_PATH, WORKSPACE_DIR_PATH};
+    use optimuse_util::RuntimeStoreRoot::{setDefaultRuntimeStoreRootConfig, RuntimeStoreRootConfig};
+    use std::collections::BTreeMap;
+
+    /// Verifies generated watch dispatch treats the protocol stream pool id as a stream source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generated_async_watch_dispatch_opens_core_stream_pool() {
+        let mut hostManager = HostManager::withFileSystemHost(Arc::new(PosixFileSystemHost::new()));
+        let root = std::env::temp_dir().join(format!(
+            "optimuse-proxy-local-generated-dispatch-{}",
+            std::process::id()
+        ));
+        let runtimeRoot = root.join(RUNTIME_ROOT_DIR_PATH);
+        let workspaceRoot = root.join(WORKSPACE_DIR_PATH);
+        std::fs::create_dir_all(&runtimeRoot).expect("test runtime root must be created");
+        std::fs::create_dir_all(&workspaceRoot).expect("test workspace root must be created");
+        setDefaultRuntimeStoreRootConfig(RuntimeStoreRootConfig::new(
+            runtimeRoot.clone(),
+            workspaceRoot.clone(),
+        ));
+        let storageHost = Arc::new(NativeRuntimeStorageHost::new(runtimeRoot, workspaceRoot));
+        hostManager.runtimeStorageHost = Some(storageHost.clone());
+        hostManager.runtimeSqliteHost = Some(storageHost);
+        hostManager.hostJavaScriptRuntimeHost =
+            Some(Arc::new(NativeHostJavaScriptRuntimeHost::new()));
+        hostManager.hostRuntimeTaskSchedulerHost =
+            Some(Arc::new(NativeHostRuntimeTaskSchedulerHost::new()));
+        let proxy = LocalCoreProxy::new(OptimuseApplication::newWithContext(hostManager));
+        let package_manager_id =
+            LocalCoreProxy::generatedTargetForSchema("application.packageManager")
+                .expect("package manager must be generated");
+        let application_guard = proxy.application.lock().await;
+        let mut pending_watch = Box::pin(CoreLinkSharedClient::watch(
+            &proxy,
+            CoreWatchRequest::new(
+                "contended-package-watch",
+                package_manager_id,
+                "__test_missing_property",
+                CoreValue::Map(BTreeMap::new()),
+            ),
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut pending_watch)
+                .await
+                .is_err(),
+            "an async factory watch must wait instead of returning Application is busy"
+        );
+        drop(application_guard);
+        let watch_result = tokio::time::timeout(std::time::Duration::from_secs(2), pending_watch)
+            .await
+            .expect("watch must resume after the parent lock is released");
+        let error = match watch_result {
+            Err(error) => error,
+            Ok(_) => panic!("unknown property must fail after resolving the factory"),
+        };
+        assert_eq!(error.code, "WATCH_NOT_FOUND");
+        let streamId = "generated-dispatch-core-stream".to_string();
+        let source = CoreStreamSource::new(|request| {
+            let (sender, receiver) = optimuse_rslink_runtime::core_event_stream_channel();
+            sender
+                .send(CoreEvent {
+                    requestId: Some(request.requestId.clone()),
+                    target: request.target.clone(),
+                    propertyName: request.propertyName.clone(),
+                    kind: CoreEventKind::Changed,
+                    value: CoreValue::String("stream-pool-opened".to_string()),
+                })
+                .expect("test stream event receiver must stay open");
+            sender
+                .send(CoreEvent {
+                    requestId: Some(request.requestId),
+                    target: request.target.clone(),
+                    propertyName: request.propertyName,
+                    kind: CoreEventKind::Completed,
+                    value: CoreValue::Null,
+                })
+                .expect("test stream completion receiver must stay open");
+            Ok(receiver)
+        });
+        proxy.adoptCoreStreamAttachments(vec![CoreStreamAttachment {
+            streamId: streamId.clone(),
+            source: Arc::new(source),
+        }]);
+        let mut args = BTreeMap::new();
+        args.insert("streamId".to_string(), CoreValue::String(streamId));
+
+        let mut stream = generated_dispatch_core_proxy_watch_async(
+            &proxy,
+            CoreWatchRequest::new(
+                "generated-dispatch-core-stream-watch",
+                CORE_STREAM_TARGET,
+                "openCoreStream",
+                CoreValue::Map(args),
+            ),
+        )
+        .await
+        .expect("generated dispatch must open the core stream pool");
+        let event = stream
+            .recv()
+            .await
+            .expect("generated dispatch stream must produce one event");
+
+        assert_eq!(event.kind, CoreEventKind::Changed);
+        assert_eq!(
+            event.value,
+            CoreValue::String("stream-pool-opened".to_string())
+        );
+    }
+}

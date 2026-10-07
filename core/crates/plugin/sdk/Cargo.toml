@@ -1,0 +1,35 @@
+[package]
+name = "optimuse-plugin-sdk"
+version = "2.0.0-preview.14"
+edition.workspace = true
+license.workspace = true
+publish = true
+description = "Public plugin package models, ToolPkg parsers, and JavaScript execution contracts for Optimuse."
+readme = "README.md"
+repository = "https://github.com/example/Optimuse"
+documentation = "https://docs.rs/optimuse-plugin-sdk"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+chrono.workspace = true
+json5.workspace = true
+optimuse-host-api = { path = "../../foundation/host-api" }
+regex.workspace = true
+serde.workspace = true
+serde_bytes = "0.11"
+serde_json.workspace = true
+zip.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(any(target_os = "android", target_os = "ios", target_env = "ohos"))))'.dependencies]
+rquickjs.workspace = true
+
+[target.'cfg(any(target_os = "android", target_os = "ios", target_env = "ohos"))'.dependencies]
+rquickjs = { workspace = true, features = ["bindgen"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmi.workspace = true
+
+[build-dependencies]
+optimuse-plugin-sdk-codegen = { version = "=2.0.0-preview.14", path = "../codegen" }

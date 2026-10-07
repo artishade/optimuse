@@ -1,0 +1,18 @@
+[package]
+name = "optimuse-plugin-sdk-ipc"
+version = "2.0.0-preview.14"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Plugin SDK Link session, types, and Optimuse IPC dispatch over Host IPC bytes."
+
+[dependencies]
+async-trait.workspace = true
+optimuse-host-api = { path = "../../foundation/host-api" }
+optimuse-link = { path = "../../foundation/link" }
+serde.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+
+[dev-dependencies]
+optimuse-host-native-plugin-sdk-ipc = { path = "../../../../hosts/common/optimuse-host-native-plugin-sdk-ipc" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

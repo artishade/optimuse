@@ -1,0 +1,1296 @@
+#include "optimuse_runtime_channel.h"
+
+#include <flutter/encodable_value.h>
+#include <flutter/method_channel.h>
+#include <flutter/standard_method_codec.h>
+#include <windows.h>
+#include <gdiplus.h>
+#include <objidl.h>
+#include <shellapi.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdlib>
+#include <cwchar>
+#include <deque>
+#include <filesystem>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "engine_channel_lifetime.h"
+
+namespace {
+
+using BridgeHandle = void*;
+using BridgeCreate = BridgeHandle (*)();
+using BridgeCreateWithStorageRoots = BridgeHandle (*)(const char*, const char*);
+using BridgeCreateError = char* (*)();
+using BridgeDestroy = void (*)(BridgeHandle);
+using BridgeFreeString = void (*)(char*);
+using BridgeRuntimeBootstrapRead = char* (*)(const char*);
+using BridgeRuntimeBootstrapWrite = char* (*)(const char*, const char*);
+
+using OptimuseRuntimeMethodChannel =
+    flutter::MethodChannel<flutter::EncodableValue>;
+
+struct OptimuseRuntimeChannelOwner {
+  std::shared_ptr<OptimuseRuntimeMethodChannel> channel;
+  HWND window = nullptr;
+  std::atomic_bool accepting_responses{true};
+};
+
+std::vector<std::shared_ptr<OptimuseRuntimeChannelOwner>>
+    g_optimuse_runtime_channels;
+HWND g_optimuse_runtime_window = nullptr;
+DWORD g_optimuse_runtime_platform_thread_id = 0;
+std::atomic_bool g_optimuse_runtime_shutting_down{false};
+std::deque<flutter::EncodableMap> g_pending_notification_activations;
+bool g_notification_activation_receiver_ready = false;
+std::once_flag g_gdiplus_start_once;
+Gdiplus::Status g_gdiplus_start_status = Gdiplus::GenericError;
+ULONG_PTR g_gdiplus_token = 0;
+
+constexpr UINT kOptimuseRuntimePlatformTaskMessage = WM_APP + 0x520;
+
+/// Invokes one Runtime bootstrap storage export without creating a Core handle.
+bool InvokeRuntimeBootstrapStorage(const std::string& default_runtime_root,
+                                   const std::string* content,
+                                   std::string* response,
+                                   std::string* error) {
+  HMODULE library = LoadLibraryW(L"optimuse_flutter_bridge.dll");
+  if (library == nullptr) {
+    if (error != nullptr) {
+      *error = "optimuse_flutter_bridge.dll was not found";
+    }
+    return false;
+  }
+  const auto read = reinterpret_cast<BridgeRuntimeBootstrapRead>(
+      GetProcAddress(library, "optimuse_flutter_bridge_runtime_bootstrap_read"));
+  const auto write = reinterpret_cast<BridgeRuntimeBootstrapWrite>(
+      GetProcAddress(library, "optimuse_flutter_bridge_runtime_bootstrap_write"));
+  const auto free_string = reinterpret_cast<BridgeFreeString>(
+      GetProcAddress(library, "optimuse_flutter_bridge_free_string"));
+  if (read == nullptr || write == nullptr || free_string == nullptr) {
+    if (error != nullptr) {
+      *error = "optimuse flutter bootstrap exports are incomplete";
+    }
+    FreeLibrary(library);
+    return false;
+  }
+  char* raw = content == nullptr
+                  ? read(default_runtime_root.c_str())
+                  : write(default_runtime_root.c_str(), content->c_str());
+  if (raw == nullptr) {
+    if (error != nullptr) {
+      *error = "optimuse flutter bootstrap export returned null";
+    }
+    FreeLibrary(library);
+    return false;
+  }
+  if (response != nullptr) {
+    *response = raw;
+  }
+  free_string(raw);
+  FreeLibrary(library);
+  return true;
+}
+
+/// Returns whether the current foreground window belongs to this process.
+bool IsOptimuseApplicationForeground() {
+  const HWND foreground_window = ::GetForegroundWindow();
+  if (foreground_window == nullptr) {
+    return false;
+  }
+  DWORD foreground_process_id = 0;
+  ::GetWindowThreadProcessId(foreground_window, &foreground_process_id);
+  return foreground_process_id == ::GetCurrentProcessId();
+}
+
+/// Decodes one URL query component with application/x-www-form-urlencoded rules.
+bool DecodeNotificationQueryComponent(const std::string& encoded,
+                                      std::string* decoded) {
+  if (decoded == nullptr) {
+    return false;
+  }
+  std::string value;
+  value.reserve(encoded.size());
+  for (size_t index = 0; index < encoded.size(); ++index) {
+    const char character = encoded[index];
+    if (character == '+') {
+      value.push_back(' ');
+      continue;
+    }
+    if (character != '%') {
+      value.push_back(character);
+      continue;
+    }
+    if (index + 2 >= encoded.size()) {
+      return false;
+    }
+    const auto hex_value = [](char input) -> int {
+      if (input >= '0' && input <= '9') {
+        return input - '0';
+      }
+      if (input >= 'A' && input <= 'F') {
+        return input - 'A' + 10;
+      }
+      if (input >= 'a' && input <= 'f') {
+        return input - 'a' + 10;
+      }
+      return -1;
+    };
+    const int high = hex_value(encoded[index + 1]);
+    const int low = hex_value(encoded[index + 2]);
+    if (high < 0 || low < 0) {
+      return false;
+    }
+    value.push_back(static_cast<char>((high << 4) | low));
+    index += 2;
+  }
+  *decoded = std::move(value);
+  return true;
+}
+
+/// Parses one Optimuse notification protocol URI into the Flutter activation schema.
+bool ParseNotificationActivationUri(const std::string& uri,
+                                    flutter::EncodableMap* activation) {
+  if (activation == nullptr) {
+    return false;
+  }
+  constexpr char kOpenApplicationUri[] = "optimuse://notification/open-app";
+  constexpr char kOpenChatPrefix[] = "optimuse://notification/open-chat?";
+  if (uri == kOpenApplicationUri) {
+    (*activation)[flutter::EncodableValue("type")] =
+        flutter::EncodableValue("open_application");
+    return true;
+  }
+  const std::string open_chat_prefix(kOpenChatPrefix);
+  if (uri.compare(0, open_chat_prefix.size(), open_chat_prefix) != 0) {
+    return false;
+  }
+  const std::string query = uri.substr(open_chat_prefix.size());
+  std::string chat_id;
+  bool found_chat_id = false;
+  size_t query_start = 0;
+  while (query_start <= query.size()) {
+    const size_t separator = query.find('&', query_start);
+    const std::string parameter = query.substr(
+        query_start, separator == std::string::npos
+                         ? std::string::npos
+                         : separator - query_start);
+    const size_t equals = parameter.find('=');
+    if (equals == std::string::npos) {
+      return false;
+    }
+    std::string key;
+    std::string value;
+    if (!DecodeNotificationQueryComponent(parameter.substr(0, equals), &key) ||
+        !DecodeNotificationQueryComponent(parameter.substr(equals + 1), &value)) {
+      return false;
+    }
+    if (key == "chatId") {
+      if (found_chat_id || value.empty()) {
+        return false;
+      }
+      chat_id = std::move(value);
+      found_chat_id = true;
+    }
+    if (separator == std::string::npos) {
+      break;
+    }
+    query_start = separator + 1;
+  }
+  if (!found_chat_id) {
+    return false;
+  }
+  (*activation)[flutter::EncodableValue("type")] =
+      flutter::EncodableValue("open_chat");
+  (*activation)[flutter::EncodableValue("chatId")] =
+      flutter::EncodableValue(chat_id);
+  return true;
+}
+
+/// Sends one notification activation to each running Flutter engine.
+void EmitNotificationActivation(const flutter::EncodableMap& activation) {
+  for (const auto& owner : g_optimuse_runtime_channels) {
+    if (!owner->accepting_responses.load() ||
+        owner->window != g_optimuse_runtime_window) {
+      continue;
+    }
+    owner->channel->InvokeMethod(
+        "notificationActivation",
+        std::make_unique<flutter::EncodableValue>(activation));
+  }
+}
+
+/// Queues or emits one notification activation on the Windows platform thread.
+void DispatchNotificationActivation(flutter::EncodableMap activation) {
+  if (!g_notification_activation_receiver_ready) {
+    g_pending_notification_activations.push_back(std::move(activation));
+    return;
+  }
+  EmitNotificationActivation(activation);
+}
+
+/// Builds a filesystem path from UTF-8 bytes under C++20 char8_t rules.
+std::filesystem::path PathFromUtf8(const std::string& value) {
+  std::u8string utf8;
+  utf8.reserve(value.size());
+  for (const unsigned char byte : value) {
+    utf8.push_back(static_cast<char8_t>(byte));
+  }
+  return std::filesystem::path(utf8);
+}
+
+/// Converts a filesystem path into UTF-8 bytes under C++20 char8_t rules.
+std::string PathToUtf8(const std::filesystem::path& value) {
+  const std::u8string utf8 = value.u8string();
+  std::string result;
+  result.reserve(utf8.size());
+  for (const char8_t byte : utf8) {
+    result.push_back(static_cast<char>(byte));
+  }
+  return result;
+}
+
+/// Normalizes one caller-supplied Windows storage root.
+bool NormalizeWindowsStorageRoot(const std::string& requested,
+                                 const char* label,
+                                 std::string* storage_root,
+                                 std::string* error) {
+  if (storage_root == nullptr || label == nullptr) {
+    if (error != nullptr) {
+      *error = "storage root output and label are required";
+    }
+    return false;
+  }
+  if (requested.empty()) {
+    if (error != nullptr) {
+      *error = std::string(label) + " is required";
+    }
+    return false;
+  }
+  const std::filesystem::path path = PathFromUtf8(requested).lexically_normal();
+  if (!path.is_absolute()) {
+    if (error != nullptr) {
+      *error = std::string(label) + " must be an absolute path";
+    }
+    return false;
+  }
+  *storage_root = PathToUtf8(path);
+  return true;
+}
+
+/// Resolves the default Windows runtime and workspace roots.
+bool ResolveWindowsDefaultStorageRoots(std::string* runtime_root,
+                                       std::string* workspace_root,
+                                       std::string* error) {
+  if (runtime_root == nullptr || workspace_root == nullptr) {
+    if (error != nullptr) {
+      *error = "runtime and workspace root outputs are required";
+    }
+    return false;
+  }
+  const DWORD required =
+      ::GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+  if (required == 0) {
+    if (error != nullptr) {
+      *error = "APPDATA is required for Optimuse runtime storage";
+    }
+    return false;
+  }
+  std::wstring app_data(required, L'\0');
+  const DWORD written =
+      ::GetEnvironmentVariableW(L"APPDATA", app_data.data(), required);
+  if (written == 0 || written >= required) {
+    if (error != nullptr) {
+      *error = "Unable to read APPDATA for Optimuse runtime storage";
+    }
+    return false;
+  }
+  app_data.resize(written);
+  const std::filesystem::path base =
+      std::filesystem::path(app_data) / L"Optimuse";
+  *runtime_root = PathToUtf8(base / L"runtime");
+  *workspace_root = PathToUtf8(base / L"workspaces");
+  return true;
+}
+
+/// Builds Flutter storage path values for resolved Windows roots.
+flutter::EncodableValue WindowsStoragePaths(const std::string& runtime_root,
+                                            const std::string& workspace_root) {
+  flutter::EncodableMap paths;
+  paths[flutter::EncodableValue("runtimeRoot")] =
+      flutter::EncodableValue(runtime_root);
+  paths[flutter::EncodableValue("workspaceRoot")] =
+      flutter::EncodableValue(workspace_root);
+  return flutter::EncodableValue(paths);
+}
+
+/// Starts GDI+ for clipboard bitmap encoding.
+bool EnsureGdiplus(std::string* error) {
+  std::call_once(g_gdiplus_start_once, []() {
+    Gdiplus::GdiplusStartupInput input;
+    g_gdiplus_start_status =
+        Gdiplus::GdiplusStartup(&g_gdiplus_token, &input, nullptr);
+  });
+  if (g_gdiplus_start_status != Gdiplus::Ok) {
+    if (error != nullptr) {
+      *error = "GDI+ could not start for clipboard image encoding";
+    }
+    return false;
+  }
+  return true;
+}
+
+/// Resolves the GDI+ PNG encoder identifier.
+bool PngEncoderClsid(CLSID* clsid, std::string* error) {
+  if (clsid == nullptr) {
+    if (error != nullptr) {
+      *error = "PNG encoder output is required";
+    }
+    return false;
+  }
+  UINT encoder_count = 0;
+  UINT encoder_size = 0;
+  if (Gdiplus::GetImageEncodersSize(&encoder_count, &encoder_size) !=
+          Gdiplus::Ok ||
+      encoder_size == 0) {
+    if (error != nullptr) {
+      *error = "PNG encoder metadata was not available";
+    }
+    return false;
+  }
+  std::vector<uint8_t> buffer(encoder_size);
+  auto* encoders =
+      reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+  if (Gdiplus::GetImageEncoders(
+          encoder_count, encoder_size, encoders) != Gdiplus::Ok) {
+    if (error != nullptr) {
+      *error = "PNG encoder metadata could not be read";
+    }
+    return false;
+  }
+  for (UINT index = 0; index < encoder_count; ++index) {
+    if (std::wcscmp(encoders[index].MimeType, L"image/png") == 0) {
+      *clsid = encoders[index].Clsid;
+      return true;
+    }
+  }
+  if (error != nullptr) {
+    *error = "PNG encoder was not found";
+  }
+  return false;
+}
+
+/// Encodes one Windows bitmap handle into PNG bytes.
+bool PngBytesFromBitmap(HBITMAP bitmap,
+                        std::vector<uint8_t>* png,
+                        std::string* error) {
+  if (bitmap == nullptr || png == nullptr) {
+    if (error != nullptr) {
+      *error = "Windows clipboard bitmap is required";
+    }
+    return false;
+  }
+  if (!EnsureGdiplus(error)) {
+    return false;
+  }
+  CLSID png_encoder{};
+  if (!PngEncoderClsid(&png_encoder, error)) {
+    return false;
+  }
+  IStream* stream = nullptr;
+  HRESULT stream_status = ::CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+  if (FAILED(stream_status) || stream == nullptr) {
+    if (error != nullptr) {
+      *error = "PNG output stream could not be created";
+    }
+    return false;
+  }
+  Gdiplus::Bitmap image(bitmap, nullptr);
+  if (image.GetLastStatus() != Gdiplus::Ok ||
+      image.Save(stream, &png_encoder, nullptr) != Gdiplus::Ok) {
+    stream->Release();
+    if (error != nullptr) {
+      *error = "Windows clipboard bitmap could not be encoded";
+    }
+    return false;
+  }
+  STATSTG stats{};
+  if (FAILED(stream->Stat(&stats, STATFLAG_NONAME)) ||
+      stats.cbSize.QuadPart == 0 ||
+      stats.cbSize.QuadPart >
+          static_cast<ULONGLONG>(std::numeric_limits<ULONG>::max())) {
+    stream->Release();
+    if (error != nullptr) {
+      *error = "PNG output stream length was invalid";
+    }
+    return false;
+  }
+  LARGE_INTEGER origin{};
+  stream->Seek(origin, STREAM_SEEK_SET, nullptr);
+  png->resize(static_cast<size_t>(stats.cbSize.QuadPart));
+  ULONG read = 0;
+  const HRESULT read_status =
+      stream->Read(png->data(), static_cast<ULONG>(png->size()), &read);
+  stream->Release();
+  if (FAILED(read_status) || read != png->size()) {
+    if (error != nullptr) {
+      *error = "PNG output stream could not be read";
+    }
+    return false;
+  }
+  return true;
+}
+
+/// Reads PNG byte payloads from the Windows clipboard.
+bool ReadWindowsClipboardImages(HWND window,
+                                flutter::EncodableValue* output,
+                                std::string* error) {
+  if (output == nullptr) {
+    if (error != nullptr) {
+      *error = "clipboard output is required";
+    }
+    return false;
+  }
+  flutter::EncodableList images;
+  if (!::OpenClipboard(window)) {
+    if (error != nullptr) {
+      *error = "Windows clipboard could not be opened";
+    }
+    return false;
+  }
+  struct ClipboardClose {
+    /// Closes the Win32 clipboard opened by this scope.
+    ~ClipboardClose() { ::CloseClipboard(); }
+  } close_clipboard;
+  if (!::IsClipboardFormatAvailable(CF_BITMAP)) {
+    *output = flutter::EncodableValue(images);
+    return true;
+  }
+  HBITMAP bitmap = static_cast<HBITMAP>(::GetClipboardData(CF_BITMAP));
+  std::vector<uint8_t> png;
+  if (!PngBytesFromBitmap(bitmap, &png, error)) {
+    return false;
+  }
+  flutter::EncodableMap item;
+  item[flutter::EncodableValue("mimeType")] =
+      flutter::EncodableValue("image/png");
+  item[flutter::EncodableValue("bytes")] =
+      flutter::EncodableValue(std::move(png));
+  images.emplace_back(std::move(item));
+  *output = flutter::EncodableValue(std::move(images));
+  return true;
+}
+
+class OptimuseRuntimePlatformTask {
+ public:
+  virtual ~OptimuseRuntimePlatformTask() = default;
+  virtual void Run() = 0;
+};
+
+template <typename Callback>
+class OptimuseRuntimePlatformTaskImpl final : public OptimuseRuntimePlatformTask {
+ public:
+  explicit OptimuseRuntimePlatformTaskImpl(Callback callback)
+      : callback_(std::move(callback)) {}
+
+  void Run() override { callback_(); }
+
+ private:
+  Callback callback_;
+};
+
+/// Owns move-only tasks executed by the persistent runtime worker threads.
+class OptimuseRuntimeWorkerTask {
+ public:
+  virtual ~OptimuseRuntimeWorkerTask() = default;
+  virtual void Run() = 0;
+};
+
+/// Stores one move-only callable for the runtime worker queue.
+template <typename Callback>
+class OptimuseRuntimeWorkerTaskImpl final : public OptimuseRuntimeWorkerTask {
+ public:
+  explicit OptimuseRuntimeWorkerTaskImpl(Callback callback)
+      : callback_(std::move(callback)) {}
+
+  void Run() override { callback_(); }
+
+ private:
+  Callback callback_;
+};
+
+/// Executes runtime bridge work on a fixed set of reusable native threads.
+class OptimuseRuntimeWorkerQueue {
+ public:
+  /// Starts the requested number of reusable worker threads.
+  explicit OptimuseRuntimeWorkerQueue(size_t worker_count) {
+    workers_.reserve(worker_count);
+    for (size_t index = 0; index < worker_count; ++index) {
+      workers_.emplace_back([this]() { RunWorker(); });
+    }
+  }
+
+  /// Stops the queue after every already-submitted task completes.
+  ~OptimuseRuntimeWorkerQueue() { Shutdown(); }
+
+  /// Adds one callable to the runtime worker queue.
+  template <typename Callback>
+  bool Post(Callback&& callback) {
+    auto task = std::make_unique<
+        OptimuseRuntimeWorkerTaskImpl<std::decay_t<Callback>>>(
+        std::forward<Callback>(callback));
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_) {
+        return false;
+      }
+      tasks_.push_back(std::move(task));
+    }
+    condition_.notify_one();
+    return true;
+  }
+
+  /// Waits for workers to drain submitted work and terminate.
+  void Shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_) {
+        return;
+      }
+      stopping_ = true;
+    }
+    condition_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers_.clear();
+  }
+
+ private:
+  /// Runs the task loop for one persistent runtime worker.
+  void RunWorker() {
+    while (true) {
+      std::unique_ptr<OptimuseRuntimeWorkerTask> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this]() { return stopping_ || !tasks_.empty(); });
+        if (stopping_ && tasks_.empty()) {
+          return;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+      task->Run();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  std::deque<std::unique_ptr<OptimuseRuntimeWorkerTask>> tasks_;
+  std::vector<std::thread> workers_;
+  bool stopping_ = false;
+};
+
+std::mutex g_optimuse_runtime_platform_tasks_mutex;
+std::deque<std::unique_ptr<OptimuseRuntimePlatformTask>>
+    g_optimuse_runtime_platform_tasks;
+bool g_optimuse_runtime_platform_task_message_pending = false;
+std::unique_ptr<OptimuseRuntimeWorkerQueue> g_optimuse_runtime_workers;
+
+/// Queues a task for the Windows platform thread and coalesces wake-up messages.
+template <typename Callback>
+bool PostOptimuseRuntimePlatformTask(Callback&& callback) {
+  auto task = std::make_unique<
+      OptimuseRuntimePlatformTaskImpl<std::decay_t<Callback>>>(
+      std::forward<Callback>(callback));
+  std::lock_guard<std::mutex> lock(g_optimuse_runtime_platform_tasks_mutex);
+  if (g_optimuse_runtime_window == nullptr) {
+    return false;
+  }
+  g_optimuse_runtime_platform_tasks.push_back(std::move(task));
+  if (g_optimuse_runtime_platform_task_message_pending) {
+    return true;
+  }
+  if (::PostMessage(g_optimuse_runtime_window, kOptimuseRuntimePlatformTaskMessage,
+                    0, 0) == 0) {
+    g_optimuse_runtime_platform_tasks.pop_back();
+    return false;
+  }
+  g_optimuse_runtime_platform_task_message_pending = true;
+  return true;
+}
+
+/// Drops platform tasks that can no longer run during process shutdown.
+void ClearOptimuseRuntimePlatformTasks() {
+  std::lock_guard<std::mutex> lock(g_optimuse_runtime_platform_tasks_mutex);
+  g_optimuse_runtime_platform_tasks.clear();
+  g_optimuse_runtime_platform_task_message_pending = false;
+}
+
+class OptimuseRuntimeLibrary {
+ public:
+  OptimuseRuntimeLibrary() = default;
+  /// Releases the host runtime reference while preserving loaded FFI code.
+  ~OptimuseRuntimeLibrary() {
+    if (handle_ != nullptr && destroy_ != nullptr) {
+      destroy_(handle_);
+      handle_ = nullptr;
+    }
+    // FFI function pointers and VM finalizers retain this module until process exit.
+  }
+
+  bool EnsureReady(std::string* error) {
+    if (handle_ != nullptr) {
+      return true;
+    }
+    if (library_ == nullptr) {
+      library_ = LoadLibraryW(L"optimuse_flutter_bridge.dll");
+      if (library_ == nullptr) {
+        AssignError(error, "optimuse_flutter_bridge.dll was not found");
+        return false;
+      }
+      create_ = reinterpret_cast<BridgeCreate>(
+          GetProcAddress(library_, "optimuse_flutter_bridge_create"));
+      create_with_storage_roots_ =
+          reinterpret_cast<BridgeCreateWithStorageRoots>(
+              GetProcAddress(
+                  library_,
+                  "optimuse_flutter_bridge_create_with_storage_roots"));
+      create_error_ = reinterpret_cast<BridgeCreateError>(
+          GetProcAddress(library_, "optimuse_flutter_bridge_create_error"));
+      destroy_ = reinterpret_cast<BridgeDestroy>(
+          GetProcAddress(library_, "optimuse_flutter_bridge_destroy"));
+      free_string_ = reinterpret_cast<BridgeFreeString>(
+          GetProcAddress(library_, "optimuse_flutter_bridge_free_string"));
+
+      if (create_ == nullptr || create_with_storage_roots_ == nullptr ||
+          destroy_ == nullptr ||
+          free_string_ == nullptr) {
+        AssignError(error, "optimuse flutter bridge exports are incomplete");
+        return false;
+      }
+    }
+    if (configured_runtime_root_.empty() || configured_workspace_root_.empty()) {
+      AssignError(error, "Runtime and workspace roots must be configured before runtime creation");
+      return false;
+    }
+    handle_ = create_with_storage_roots_(
+        configured_runtime_root_.c_str(),
+        configured_workspace_root_.c_str());
+    if (handle_ == nullptr) {
+      AssignError(error, ReadCreateError());
+      return false;
+    }
+    return true;
+  }
+
+  /// Creates a retained Dart FFI connection to the process-owned runtime.
+  bool ConnectCoreFfi(std::string* response, std::string* error) {
+    if (!EnsureReadyThreadSafe(error)) return false;
+    const auto connect = reinterpret_cast<char* (*)(BridgeHandle)>(
+        GetProcAddress(library_, "optimuse_flutter_bridge_ffi_connect"));
+    if (connect == nullptr) {
+      AssignError(error, "optimuse flutter FFI connect export is missing");
+      return false;
+    }
+    return TakeBridgeString(connect(handle_), response, error);
+  }
+
+
+
+  /// Sets the runtime and workspace roots used when the runtime handle is created.
+  bool SetStorageRoots(const std::string& runtime_root,
+                       const std::string& workspace_root,
+                       std::string* error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string resolved_runtime_root;
+    std::string resolved_workspace_root;
+    if (!NormalizeWindowsStorageRoot(
+            runtime_root, "runtimeRoot", &resolved_runtime_root, error)) {
+      return false;
+    }
+    if (!NormalizeWindowsStorageRoot(
+            workspace_root, "workspaceRoot", &resolved_workspace_root, error)) {
+      return false;
+    }
+    if (handle_ != nullptr) {
+      if (configured_runtime_root_ == resolved_runtime_root &&
+          configured_workspace_root_ == resolved_workspace_root) {
+        return true;
+      }
+      AssignError(
+          error,
+          "Runtime and workspace roots cannot change after runtime creation");
+      return false;
+    }
+    configured_runtime_root_ = std::move(resolved_runtime_root);
+    configured_workspace_root_ = std::move(resolved_workspace_root);
+    return true;
+  }
+
+ private:
+  bool EnsureReadyThreadSafe(std::string* error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return EnsureReady(error);
+  }
+
+  static void AssignError(std::string* target, const std::string& value) {
+    if (target != nullptr) {
+      *target = value;
+    }
+  }
+
+  std::string ReadCreateError() {
+    if (create_error_ == nullptr || free_string_ == nullptr) {
+      return "failed to initialize optimuse flutter bridge";
+    }
+    char* raw_error = create_error_();
+    std::string error;
+    std::string ignored;
+    if (TakeBridgeString(raw_error, &error, &ignored) && !error.empty()) {
+      return error;
+    }
+    return "failed to initialize optimuse flutter bridge";
+  }
+
+  bool TakeBridgeString(char* value, std::string* output, std::string* error) {
+    if (value == nullptr) {
+      AssignError(error, "optimuse flutter bridge returned null");
+      return false;
+    }
+    if (output != nullptr) {
+      *output = value;
+    }
+    free_string_(value);
+    return true;
+  }
+
+  HMODULE library_ = nullptr;
+  BridgeHandle handle_ = nullptr;
+  std::string configured_runtime_root_;
+  std::string configured_workspace_root_;
+  std::mutex mutex_;
+  BridgeCreate create_ = nullptr;
+  BridgeCreateWithStorageRoots create_with_storage_roots_ = nullptr;
+  BridgeCreateError create_error_ = nullptr;
+  BridgeDestroy destroy_ = nullptr;
+  BridgeFreeString free_string_ = nullptr;
+};
+
+using OptimuseRuntimeActiveLibrary = OptimuseRuntimeLibrary;
+
+std::shared_ptr<OptimuseRuntimeActiveLibrary> g_optimuse_runtime_library;
+
+const std::string* StringArgument(
+    const flutter::MethodCall<flutter::EncodableValue>& method_call) {
+  const flutter::EncodableValue* arguments = method_call.arguments();
+  if (arguments == nullptr) {
+    return nullptr;
+  }
+  return std::get_if<std::string>(arguments);
+}
+
+const std::string* StringMapValue(
+    const flutter::MethodCall<flutter::EncodableValue>& method_call,
+    const char* key) {
+  const flutter::EncodableValue* arguments = method_call.arguments();
+  if (arguments == nullptr) {
+    return nullptr;
+  }
+  const auto* map =
+      std::get_if<flutter::EncodableMap>(arguments);
+  if (map == nullptr) {
+    return nullptr;
+  }
+  auto item = map->find(flutter::EncodableValue(std::string(key)));
+  if (item == map->end()) {
+    return nullptr;
+  }
+  return std::get_if<std::string>(&item->second);
+}
+
+// Reads an integer value from a Flutter method argument map.
+bool IntegerMapValue(
+    const flutter::MethodCall<flutter::EncodableValue>& method_call,
+    const char* key,
+    int64_t* value) {
+  const flutter::EncodableValue* arguments = method_call.arguments();
+  if (arguments == nullptr || value == nullptr) {
+    return false;
+  }
+  const auto* map =
+      std::get_if<flutter::EncodableMap>(arguments);
+  if (map == nullptr) {
+    return false;
+  }
+  auto item = map->find(flutter::EncodableValue(std::string(key)));
+  if (item == map->end()) {
+    return false;
+  }
+  const auto* int32_value = std::get_if<int32_t>(&item->second);
+  if (int32_value != nullptr) {
+    *value = *int32_value;
+    return true;
+  }
+  const auto* int64_value = std::get_if<int64_t>(&item->second);
+  if (int64_value != nullptr) {
+    *value = *int64_value;
+    return true;
+  }
+  return false;
+}
+
+bool IsCurrentProcessElevated() {
+  HANDLE token = nullptr;
+  if (::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token) == 0) {
+    return false;
+  }
+  TOKEN_ELEVATION elevation{};
+  DWORD size = 0;
+  const BOOL ok = ::GetTokenInformation(token, TokenElevation, &elevation,
+                                        sizeof(elevation), &size);
+  ::CloseHandle(token);
+  return ok != 0 && elevation.TokenIsElevated != 0;
+}
+
+/// Builds the Windows elevation permission status snapshot.
+flutter::EncodableValue WindowsOnboardingRequirementSnapshot() {
+  flutter::EncodableMap snapshot;
+  flutter::EncodableMap admin;
+  admin[flutter::EncodableValue("id")] =
+      flutter::EncodableValue("windows.admin");
+  admin[flutter::EncodableValue("status")] = flutter::EncodableValue(
+      IsCurrentProcessElevated() ? "Satisfied" : "Missing");
+  snapshot[flutter::EncodableValue("windows.admin")] =
+      flutter::EncodableValue(admin);
+  return flutter::EncodableValue(snapshot);
+}
+
+/// Starts a Windows elevation request and treats UAC cancellation as a normal result.
+void RequestWindowsAdminAuthorization(
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  wchar_t exe_path[MAX_PATH];
+  const DWORD path_length =
+      ::GetModuleFileNameW(nullptr, exe_path, static_cast<DWORD>(MAX_PATH));
+  if (path_length == 0 || path_length >= MAX_PATH) {
+    result->Error("HOST_AUTHORIZATION_ERROR",
+                  "Unable to read current executable path");
+    return;
+  }
+
+  HINSTANCE instance =
+      ::ShellExecuteW(nullptr, L"runas", exe_path, nullptr, nullptr,
+                      SW_SHOWNORMAL);
+  const INT_PTR launch_status = reinterpret_cast<INT_PTR>(instance);
+  if (launch_status == SE_ERR_ACCESSDENIED) {
+    result->Success();
+    return;
+  }
+  if (launch_status <= 32) {
+    result->Error("HOST_AUTHORIZATION_DENIED",
+                  "Administrator launch was not approved");
+    return;
+  }
+  result->Success();
+}
+
+/// Unregisters and removes one runtime channel while its engine is alive.
+void ShutdownOptimuseRuntimeChannelInstance(
+    const std::shared_ptr<OptimuseRuntimeChannelOwner>& owner) {
+  owner->accepting_responses.store(false);
+  owner->channel->SetMethodCallHandler(nullptr);
+  const auto channel_iterator = std::find(
+      g_optimuse_runtime_channels.begin(), g_optimuse_runtime_channels.end(), owner);
+  if (channel_iterator != g_optimuse_runtime_channels.end()) {
+    g_optimuse_runtime_channels.erase(channel_iterator);
+  }
+}
+
+/// Runs one Rust bridge operation off the Windows platform thread.
+template <typename Operation>
+void RespondRuntimeStringAsync(
+    const std::shared_ptr<OptimuseRuntimeChannelOwner>& channel_owner,
+    Operation operation,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  auto* workers = g_optimuse_runtime_workers.get();
+  if (workers == nullptr) {
+    result->Error("RUNTIME_WORKER_QUEUE_CLOSED",
+                  "runtime worker queue is not available");
+    return;
+  }
+  auto result_holder = std::make_shared<
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>>(
+      std::move(result));
+  const bool submitted = workers->Post(
+      [channel_owner, operation = std::move(operation), result_holder]() mutable {
+    std::string response;
+    std::string error;
+    const bool ok = operation(&response, &error);
+    auto platform_result = std::move(*result_holder);
+    PostOptimuseRuntimePlatformTask(
+        [channel_owner, result = std::move(platform_result), ok, response = std::move(response),
+         error = std::move(error)]() mutable {
+          if (!channel_owner->accepting_responses.load()) {
+            return;
+          }
+          if (ok) {
+            result->Success(flutter::EncodableValue(response));
+          } else {
+            result->Error("RUNTIME_BRIDGE_ERROR", error);
+          }
+        });
+  });
+  if (!submitted) {
+    auto platform_result = std::move(*result_holder);
+    platform_result->Error("RUNTIME_WORKER_QUEUE_CLOSED",
+                           "runtime worker queue is not accepting work");
+  }
+}
+
+/// Runs one void Rust bridge operation off the Windows platform thread.
+template <typename Operation>
+void RespondRuntimeVoidAsync(
+    const std::shared_ptr<OptimuseRuntimeChannelOwner>& channel_owner,
+    Operation operation,
+    std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  auto* workers = g_optimuse_runtime_workers.get();
+  if (workers == nullptr) {
+    result->Error("RUNTIME_WORKER_QUEUE_CLOSED",
+                  "runtime worker queue is not available");
+    return;
+  }
+  auto result_holder = std::make_shared<
+      std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>>(
+      std::move(result));
+  const bool submitted = workers->Post(
+      [channel_owner, operation = std::move(operation), result_holder]() mutable {
+    std::string error;
+    const bool ok = operation(&error);
+    auto platform_result = std::move(*result_holder);
+    PostOptimuseRuntimePlatformTask(
+        [channel_owner, result = std::move(platform_result), ok, error = std::move(error)]() mutable {
+          if (!channel_owner->accepting_responses.load()) {
+            return;
+          }
+          if (ok) {
+            result->Success();
+          } else {
+            result->Error("RUNTIME_BRIDGE_ERROR", error);
+          }
+        });
+  });
+  if (!submitted) {
+    auto platform_result = std::move(*result_holder);
+    platform_result->Error("RUNTIME_WORKER_QUEUE_CLOSED",
+                           "runtime worker queue is not accepting work");
+  }
+}
+
+}  // namespace
+
+/// Dispatches queued runtime results on the Windows platform thread.
+bool HandleOptimuseRuntimeChannelWindowMessage(UINT message,
+                                             WPARAM wparam,
+                                             LPARAM lparam,
+                                             LRESULT* result) {
+  if (message != kOptimuseRuntimePlatformTaskMessage) {
+    return false;
+  }
+  std::deque<std::unique_ptr<OptimuseRuntimePlatformTask>> tasks;
+  {
+    std::lock_guard<std::mutex> lock(g_optimuse_runtime_platform_tasks_mutex);
+    g_optimuse_runtime_platform_task_message_pending = false;
+    tasks.swap(g_optimuse_runtime_platform_tasks);
+  }
+  for (const auto& task : tasks) {
+    task->Run();
+  }
+  if (result != nullptr) {
+    *result = 0;
+  }
+  return true;
+}
+
+/// Receives one protocol activation from a secondary Windows process.
+bool HandleOptimuseNotificationActivationWindowMessage(UINT message,
+                                                      WPARAM wparam,
+                                                      LPARAM lparam,
+                                                      LRESULT* result) {
+  (void)wparam;
+  if (message != WM_COPYDATA) {
+    return false;
+  }
+  const auto* copy_data = reinterpret_cast<const COPYDATASTRUCT*>(lparam);
+  if (copy_data == nullptr ||
+      copy_data->dwData != kOptimuseNotificationActivationCopyData ||
+      copy_data->lpData == nullptr || copy_data->cbData == 0) {
+    return false;
+  }
+  const auto* bytes = static_cast<const char*>(copy_data->lpData);
+  std::string uri(bytes, bytes + copy_data->cbData);
+  if (!uri.empty() && uri.back() == '\0') {
+    uri.pop_back();
+  }
+  flutter::EncodableMap activation;
+  if (!ParseNotificationActivationUri(uri, &activation)) {
+    if (result != nullptr) {
+      *result = FALSE;
+    }
+    return true;
+  }
+  DispatchNotificationActivation(std::move(activation));
+  if (result != nullptr) {
+    *result = TRUE;
+  }
+  return true;
+}
+
+/// Registers one runtime channel whose lifetime follows its Flutter engine.
+void RegisterOptimuseRuntimeChannel(flutter::FlutterEngine* engine, HWND window) {
+  g_optimuse_runtime_shutting_down.store(false);
+  if (g_optimuse_runtime_window == nullptr) {
+    g_optimuse_runtime_window = window;
+    g_optimuse_runtime_platform_thread_id = ::GetCurrentThreadId();
+  }
+  if (!g_optimuse_runtime_library) {
+    g_optimuse_runtime_library = std::make_shared<OptimuseRuntimeActiveLibrary>();
+  }
+  if (!g_optimuse_runtime_workers) {
+    g_optimuse_runtime_workers = std::make_unique<OptimuseRuntimeWorkerQueue>(4);
+  }
+  auto channel_owner = std::make_shared<OptimuseRuntimeChannelOwner>();
+  channel_owner->window = window;
+  channel_owner->channel = std::make_shared<OptimuseRuntimeMethodChannel>(
+          engine->messenger(), "optimuse/runtime",
+          &flutter::StandardMethodCodec::GetInstance());
+  auto runtime_library = g_optimuse_runtime_library;
+
+  channel_owner->channel->SetMethodCallHandler(
+      [channel_owner, runtime_library](const flutter::MethodCall<flutter::EncodableValue>& method_call,
+         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+             result) {
+        std::string error;
+        if (method_call.method_name().compare(
+                "notificationActivationInitial") == 0) {
+          if (g_pending_notification_activations.empty()) {
+            result->Success();
+            return;
+          }
+          flutter::EncodableMap activation =
+              std::move(g_pending_notification_activations.front());
+          g_pending_notification_activations.pop_front();
+          result->Success(flutter::EncodableValue(activation));
+          return;
+        }
+        if (method_call.method_name().compare(
+                "notificationActivationReady") == 0) {
+          g_notification_activation_receiver_ready = true;
+          while (!g_pending_notification_activations.empty()) {
+            flutter::EncodableMap activation =
+                std::move(g_pending_notification_activations.front());
+            g_pending_notification_activations.pop_front();
+            EmitNotificationActivation(activation);
+          }
+          result->Success();
+          return;
+        }
+        if (method_call.method_name().compare("restartApplication") == 0) {
+          if (g_optimuse_runtime_window == nullptr ||
+              ::PostMessage(g_optimuse_runtime_window, WM_CLOSE, 0, 0) == 0) {
+            result->Error("APPLICATION_TERMINATION_ERROR",
+                          "Windows application close request failed");
+            return;
+          }
+          result->Success();
+          return;
+        }
+        if (method_call.method_name().compare(
+                "applicationIsForeground") == 0) {
+          result->Success(
+              flutter::EncodableValue(IsOptimuseApplicationForeground()));
+          return;
+        }
+        if (method_call.method_name().compare("readClipboardImages") == 0) {
+          flutter::EncodableValue images;
+          if (!ReadWindowsClipboardImages(
+                  channel_owner->window, &images, &error)) {
+            result->Error("CLIPBOARD_IMAGE_READ_ERROR", error);
+            return;
+          }
+          result->Success(images);
+          return;
+        }
+        if (method_call.method_name().compare(
+                "localRuntimeStorageDefaults") == 0) {
+          std::string runtime_root;
+          std::string workspace_root;
+          if (!ResolveWindowsDefaultStorageRoots(
+                  &runtime_root, &workspace_root, &error)) {
+            result->Error("RUNTIME_STORAGE_DEFAULTS_ERROR", error);
+            return;
+          }
+          result->Success(WindowsStoragePaths(runtime_root, workspace_root));
+          return;
+        }
+        if (method_call.method_name().compare(
+                "runtimeBootstrapRead") == 0) {
+          std::string runtime_root;
+          std::string workspace_root;
+          std::string response;
+          if (!ResolveWindowsDefaultStorageRoots(
+                  &runtime_root, &workspace_root, &error) ||
+              !InvokeRuntimeBootstrapStorage(
+                  runtime_root, nullptr, &response, &error)) {
+            result->Error("RUNTIME_BOOTSTRAP_READ_ERROR", error);
+            return;
+          }
+          result->Success(flutter::EncodableValue(response));
+          return;
+        }
+        if (method_call.method_name().compare(
+                "runtimeBootstrapWrite") == 0) {
+          const std::string* content = StringArgument(method_call);
+          if (content == nullptr) {
+            result->Error(
+                "INVALID_ARGS", "runtimeBootstrapWrite expects JSON text");
+            return;
+          }
+          std::string runtime_root;
+          std::string workspace_root;
+          std::string response;
+          if (!ResolveWindowsDefaultStorageRoots(
+                  &runtime_root, &workspace_root, &error) ||
+              !InvokeRuntimeBootstrapStorage(
+                  runtime_root, content, &response, &error)) {
+            result->Error("RUNTIME_BOOTSTRAP_WRITE_ERROR", error);
+            return;
+          }
+          result->Success(flutter::EncodableValue(response));
+          return;
+        }
+        if (method_call.method_name().compare(
+                "localRuntimeStoragePaths") == 0) {
+          const std::string* requested_runtime_root =
+              StringMapValue(method_call, "runtimeRoot");
+          const std::string* requested_workspace_root =
+              StringMapValue(method_call, "workspaceRoot");
+          if (requested_runtime_root == nullptr ||
+              requested_workspace_root == nullptr) {
+            result->Error(
+                "INVALID_ARGS",
+                "localRuntimeStoragePaths expects runtimeRoot and workspaceRoot");
+            return;
+          }
+          std::string runtime_root;
+          std::string workspace_root;
+          if (!NormalizeWindowsStorageRoot(
+                  *requested_runtime_root, "runtimeRoot", &runtime_root, &error) ||
+              !NormalizeWindowsStorageRoot(
+                  *requested_workspace_root,
+                  "workspaceRoot",
+                  &workspace_root,
+                  &error)) {
+            result->Error("RUNTIME_STORAGE_PATHS_ERROR", error);
+            return;
+          }
+          result->Success(WindowsStoragePaths(runtime_root, workspace_root));
+          return;
+        }
+        if (method_call.method_name().compare(
+                "setLocalRuntimeStorage") == 0) {
+          const std::string* runtime_root =
+              StringMapValue(method_call, "runtimeRoot");
+          const std::string* workspace_root =
+              StringMapValue(method_call, "workspaceRoot");
+          if (runtime_root == nullptr || workspace_root == nullptr) {
+            result->Error(
+                "INVALID_ARGS",
+                "setLocalRuntimeStorage expects runtimeRoot and workspaceRoot");
+            return;
+          }
+          if (!runtime_library->SetStorageRoots(
+                  *runtime_root, *workspace_root, &error)) {
+            result->Error("RUNTIME_STORAGE_SET_ERROR", error);
+            return;
+          }
+          result->Success();
+          return;
+        }
+        if (method_call.method_name().compare("connectCoreFfi") == 0) {
+          RespondRuntimeStringAsync(
+              channel_owner,
+              [runtime_library](std::string* response, std::string* operation_error) {
+                return runtime_library->ConnectCoreFfi(response, operation_error);
+              },
+              std::move(result));
+          return;
+        }
+        if (method_call.method_name().compare(
+                "hostOnboardingPermissionSnapshot") == 0) {
+          const std::string* host_id = StringMapValue(method_call, "hostId");
+          if (host_id == nullptr || *host_id != "windows") {
+            result->Error("INVALID_HOST", "Invalid onboarding host");
+            return;
+          }
+          result->Success(WindowsOnboardingRequirementSnapshot());
+          return;
+        }
+        if (method_call.method_name().compare(
+                "hostOnboardingRequestPermission") == 0) {
+          const std::string* host_id = StringMapValue(method_call, "hostId");
+          const std::string* requirement_id =
+              StringMapValue(method_call, "requirementId");
+          if (host_id != nullptr && *host_id != "windows") {
+            result->Error("INVALID_HOST", "Invalid onboarding host");
+            return;
+          }
+          if (requirement_id == nullptr) {
+            result->Error("INVALID_ONBOARDING_REQUIREMENT",
+                          "Invalid onboarding requirement");
+            return;
+          }
+          if (*requirement_id == "windows.admin") {
+            RequestWindowsAdminAuthorization(std::move(result));
+            return;
+          }
+          result->Error("INVALID_ONBOARDING_REQUIREMENT",
+                        "Invalid onboarding requirement");
+          return;
+        }
+        result->NotImplemented();
+      });
+  g_optimuse_runtime_channels.push_back(channel_owner);
+  RegisterOptimuseEngineChannelShutdown(
+      engine, [channel_owner]() {
+        ShutdownOptimuseRuntimeChannelInstance(channel_owner);
+      });
+}
+
+/// Stops runtime work before the bridge library is unloaded.
+void ShutdownOptimuseRuntimeChannel() {
+  g_optimuse_runtime_shutting_down.store(true);
+  for (const auto& channel_owner : g_optimuse_runtime_channels) {
+    channel_owner->accepting_responses.store(false);
+  }
+  g_optimuse_runtime_workers.reset();
+  ClearOptimuseRuntimePlatformTasks();
+  g_optimuse_runtime_library.reset();
+  g_pending_notification_activations.clear();
+  g_notification_activation_receiver_ready = false;
+  g_optimuse_runtime_window = nullptr;
+  g_optimuse_runtime_platform_thread_id = 0;
+}

@@ -1,0 +1,59 @@
+[package]
+name = "optimuse-esp32"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Optimuse Edge firmware for ESP32-2432S028."
+
+[[bin]]
+name = "optimuse-esp32"
+path = "src/main.rs"
+
+[dependencies]
+optimuse-node-runtime = { path = "../../core/crates/node/runtime", default-features = false }
+optimuse-host-native-scheduler = { path = "../../hosts/common/optimuse-host-native-scheduler", default-features = false }
+optimuse-peer-link = { path = "../../core/crates/node/peer-link" }
+optimuse-edge-contract = { path = "../../core/crates/node/edge-contract" }
+async-trait = "0.1"
+base64 = "0.22"
+log = "0.4"
+optimuse-board-esp32 = { path = "../../hosts/boards/esp32" }
+optimuse-node-edge = { path = "../../core/crates/node/edge" }
+optimuse-host-api = { path = "../../core/crates/foundation/host-api" }
+optimuse-link = { path = "../../core/crates/foundation/link" }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+
+[target.'cfg(target_os = "espidf")'.dependencies]
+serde = { version = "1", features = ["derive"] }
+esp-idf-hal = "0.46.2"
+esp-idf-svc = "0.52.1"
+esp-idf-sys = "0.37.2"
+
+[build-dependencies]
+embuild = { version = "0.33", features = ["espidf"] }
+
+[package.metadata.esp-idf-sys]
+esp_idf_components = [
+  "main",
+  "app_update",
+  "bootloader",
+  "driver",
+  "fatfs",
+  "spiffs",
+  "wear_levelling",
+  "nvs_flash",
+  "esp_event",
+  "esp_netif",
+  "esp_wifi",
+  "esp_http_server",
+  "espressif__mdns",
+  "lvgl_port",
+  "lvgl__lvgl",
+]
+extra_components = [
+  { remote_component = { name = "espressif/mdns", version = "1.2.0" } },
+  { remote_component = { name = "lvgl/lvgl", version = "9.3.0" }, bindings_header = "lvgl_bindings.h", bindings_module = "lvgl" },
+  { component_dirs = ["lvgl_port"] },
+]

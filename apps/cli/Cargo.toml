@@ -1,0 +1,62 @@
+[package]
+name = "optimuse-cli"
+version = "2.0.0-preview.14"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[features]
+default = []
+
+[[bin]]
+name = "optimuse"
+path = "src/main.rs"
+
+[dependencies]
+arboard = "3"
+async-trait = "0.1"
+axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
+crossterm = "0.28"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+futures-util = "0.3"
+hmac = "0.12"
+image = { version = "0.25", default-features = false, features = ["png"] }
+mdns-sd = "0.12"
+optimuse-proxy-edge = { path = "../../core/crates/proxy/edge" }
+optimuse-proxy-local = { path = "../../core/crates/proxy/local" }
+optimuse-node-runtime = { path = "../../core/crates/node/runtime" }
+optimuse-core-application = { path = "../../core/crates/application/core" }
+optimuse-command-core = { path = "../../core/crates/command/core" }
+optimuse-host-api = { path = "../../core/crates/foundation/host-api" }
+optimuse-host-native-common = { path = "../../hosts/common/optimuse-host-native-common", default-features = false, features = ["tcp", "serial", "storage"] }
+optimuse-link = { path = "../../core/crates/foundation/link" }
+optimuse-model = { path = "../../core/crates/foundation/model" }
+optimuse-providers = { path = "../../core/crates/provider/services" }
+optimuse-runtime = { path = "../../core/crates/runtime/application" }
+optimuse-store = { path = "../../core/crates/persistence/store" }
+optimuse-tools = { path = "../../core/crates/tool/services" }
+optimuse-util = { path = "../../core/crates/foundation/util" }
+ratatui = "0.28"
+unicode-width = "0.1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1"
+sha2 = "0.10"
+tar = "0.4"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+optimuse-host-windows-native = { path = "../../hosts/windows" }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_WindowsProgramming"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+optimuse-host-linux-native = { path = "../../hosts/linux" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+optimuse-host-macos-native = { path = "../../hosts/macos" }

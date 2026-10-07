@@ -1,0 +1,42 @@
+[package]
+name = "optimuse-node-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["full"]
+peer-state = ["dep:ring", "dep:optimuse-store", "dep:optimuse-util", "dep:serde_json", "dep:base64"]
+full = ["peer-state", "dep:ring", "dep:uuid", "dep:futures-util", "dep:base64", "dep:serde_json", "dep:optimuse-runtime", "dep:optimuse-store", "dep:optimuse-tools", "dep:optimuse-util"]
+test-support = []
+
+[dependencies]
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"], optional = true }
+uuid = { workspace = true, optional = true }
+
+optimuse-peer-link = { path = "../peer-link" }
+async-trait.workspace = true
+futures-util = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+optimuse-host-api = { path = "../../foundation/host-api" }
+optimuse-link = { path = "../../foundation/link" }
+optimuse-runtime = { path = "../../runtime/application", default-features = false, features = ["javascript"], optional = true }
+optimuse-store = { path = "../../persistence/store", optional = true }
+optimuse-tools = { path = "../../tool/services", default-features = false, optional = true }
+optimuse-util = { path = "../../foundation/util", optional = true }
+serde.workspace = true
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["macros", "sync", "rt"] }
+
+[build-dependencies]
+quote = "1"
+syn = { version = "2", features = ["full"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+optimuse-model = { path = "../../foundation/model" }
+optimuse-rslink-runtime = { path = "../../rslink/runtime" }
+rusqlite.workspace = true
+
+optimuse-host-native-common = { path = "../../../../hosts/common/optimuse-host-native-common", features = ["tcp", "http"] }

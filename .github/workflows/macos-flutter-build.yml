@@ -1,0 +1,122 @@
+name: macOS Flutter Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      products:
+        description: "Release products to build"
+        required: false
+        default: "app"
+        type: choice
+        options:
+          - "app"
+          - "cli"
+          - "all"
+  workflow_call:
+    inputs:
+      products:
+        description: "Release products to build"
+        required: false
+        default: "app"
+        type: string
+jobs:
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: -Awarnings
+      RUST_TOOLCHAIN_VERSION: 1.95.0
+      FVM_VERSION: 4.3.0
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bootstrap Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.11.5
+
+      - name: Install FVM
+        run: |
+          dart pub global activate fvm "$FVM_VERSION"
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+
+      - name: Cache project Flutter SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/fvm
+          key: ${{ runner.os }}-fvm-${{ hashFiles('apps/flutter/app/.fvmrc') }}
+
+      - name: Install project Flutter SDK
+        working-directory: apps/flutter/app
+        run: fvm install --skip-pub-get
+
+      - name: Cache Pub packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: ${{ runner.os }}-pub-${{ hashFiles('apps/flutter/app/pubspec.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pub-
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Check build environment
+        run: python3 tools/build_scripts/check_build_environment.py --products "${{ inputs.products }}" --cli-arches all --github-runner
+
+      - name: Cache Cargo outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            core/target
+            apps/flutter/native/optimuse-flutter-bridge/target
+            apps/cli/target
+            hosts/apple/target
+            target/optimuse-build-tools
+          key: ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN_VERSION }}-cargo-${{ hashFiles('core/Cargo.lock', 'core/crates/**/Cargo.toml', 'apps/cli/Cargo.lock', 'apps/cli/Cargo.toml', 'apps/cli/src/**', 'apps/flutter/native/optimuse-flutter-bridge/Cargo.lock', 'apps/flutter/native/optimuse-flutter-bridge/Cargo.toml', 'hosts/apple/Cargo.lock', 'hosts/apple/Cargo.toml', 'hosts/web/Cargo.lock', 'hosts/web/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-${{ env.RUST_TOOLCHAIN_VERSION }}-cargo-
+
+      - name: Generate Dart proxy artifacts
+        run: |
+          cargo clean --manifest-path core/crates/proxy/local/Cargo.toml -p optimuse-proxy-local
+          cargo check --manifest-path core/crates/proxy/local/Cargo.toml --quiet
+          test -f apps/flutter/app/lib/core/proxy/generated/CoreProxyClients.g.dart
+          test -f apps/flutter/app/lib/core/proxy/generated/CoreProxyModels.g.dart
+
+      - name: Build and package macOS app
+        if: inputs.products != 'cli'
+        run: python3 tools/build_scripts/build_flutter_macos.py
+
+      - name: Build and package macOS CLI
+        if: inputs.products != 'app'
+        run: python3 tools/build_scripts/build_cli_macos.py --arches all
+
+      - name: Upload macOS app artifact
+        if: inputs.products != 'cli'
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimuse-macos-${{ github.sha }}
+          path: tools/release/dist/optimuse-app-macos-*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload macOS CLI artifacts
+        if: inputs.products != 'app'
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimuse-macos-cli-${{ github.sha }}
+          path: tools/release/dist/optimuse-cli-macos-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14

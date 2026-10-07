@@ -1,0 +1,29 @@
+[package]
+name = "optimuse-pb-sbc01-h3"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Optimuse full Core hardware runtime for PB_SBC01_H3."
+
+[[bin]]
+name = "optimuse-pb-sbc01-h3"
+path = "src/main.rs"
+
+[[bin]]
+name = "optimuse-pb-sbc01-h3-face"
+path = "src/face_console.rs"
+
+[dependencies]
+optimuse-link = { path = "../../core/crates/foundation/link" }
+optimuse-node-runtime = { path = "../../core/crates/node/runtime" }
+optimuse-board-pb-sbc01-h3 = { path = "../../hosts/boards/pb_sbc01_h3" }
+optimuse-core-application = { path = "../../core/crates/application/core" }
+optimuse-host-api = { path = "../../core/crates/foundation/host-api" }
+optimuse-node-edge = { path = "../../core/crates/node/edge" }
+optimuse-proxy-edge = { path = "../../core/crates/proxy/edge" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+optimuse-host-linux-native = { path = "../../hosts/linux" }

@@ -1,0 +1,18 @@
+[package]
+name = "optimuse-plugin-sdk-codegen"
+version = "2.0.0-preview.14"
+edition.workspace = true
+license.workspace = true
+publish = true
+description = "Rust AST based TypeScript declaration generator for optimuse-plugin-sdk."
+repository = "https://github.com/example/Optimuse"
+
+[dependencies]
+optimuse-rslink-codegen = { path = "../../rslink/codegen" }
+quote = "1"
+syn = { version = "2", features = ["full", "visit"] }
+tree-sitter = "0.25"
+tree-sitter-javascript = "0.23"
+
+[dev-dependencies]
+optimuse-proxy-scan = { path = "../../proxy/scan" }

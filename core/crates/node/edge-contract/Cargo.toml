@@ -1,0 +1,12 @@
+[package]
+name = "optimuse-edge-contract"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared address contract for Optimuse Edge Services."
+
+
+[dependencies]
+optimuse-link = { path = "../../foundation/link" }
+serde.workspace = true

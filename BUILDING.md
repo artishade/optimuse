@@ -1,0 +1,759 @@
+# Building Optimuse
+
+This file describes how to build, run, and package Optimuse from the repository root.
+
+Rust build warnings are currently expected. Treat command exit status as the signal for build success.
+
+## Repository Layout
+
+```text
+apps/cli                  Rust CLI/TUI entry
+apps/flutter/app          Flutter app entry
+core/crates               Shared Rust runtime crates
+hosts                     Native host implementations
+tools/release             Release build and publish scripts
+docs/release-versioning.md Version, tag, channel, and asset naming rules
+```
+
+## Requirements
+
+Common tools:
+
+```text
+Rust stable toolchain with rustup
+Python virtual environment at .venv
+Node.js with Corepack enabled
+pnpm 10.7.0 for plugins/packages/buildin/workflow
+Git
+```
+
+Windows desktop CLI builds:
+
+```text
+Visual Studio 2022 C++ build tools
+MSVC x64 and ARM64 components
+LLVM clang at C:\Program Files\LLVM\bin\clang.exe
+```
+
+The GNU toolchain is not a supported alternative; see
+"Windows GNU Toolchain Troubleshooting" below if you must use it.
+
+Linux desktop App builds:
+
+```text
+CMake, Ninja, pkg-config, clang, and GTK development headers
+GStreamer development headers exposing gstreamer-1.0, gstreamer-app-1.0, and
+gstreamer-audio-1.0 through pkg-config
+WebKitGTK 4.1 development headers exposing pkg-config package webkit2gtk-4.1
+```
+
+Flutter app builds:
+
+```text
+Flutter SDK
+apps/flutter/app/android/local.properties with flutter.sdk
+tools/release/secrets/android-signing.properties for Android release signing
+```
+
+GitHub publishing:
+
+```text
+tools/release/secrets/github.env
+```
+
+Required keys:
+
+```text
+GITHUB_TOKEN
+GITHUB_API_URL
+```
+
+## Windows GNU Toolchain Troubleshooting
+
+The Windows requirements above ask for the MSVC toolchain. Building with the
+GNU toolchain (`x86_64-pc-windows-gnu`) instead hits a chain of failures whose
+error messages do not point at the fix. The symptoms and fixes below were
+recorded from an actual build session (rustup `stable-x86_64-pc-windows-gnu`;
+this section only covers x86_64).
+
+### Missing `as.exe` in the rustup self-contained directory
+
+The rustup GNU toolchain ships a minimal
+`lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained\` directory without a
+working assembler (`ld.exe` and `dlltool.exe` are present), so link steps that
+go through `dlltool`-generated import libraries fail.
+
+Fix: copy `as.exe` and `ar.exe` from the MSYS2 `mingw-w64-x86_64-binutils`
+package into the self-contained directory. The directory is managed by rustup,
+so re-apply this after every `rustup update`.
+
+### The bundled `gcc.exe` cannot compile C sources
+
+The self-contained directory ships both `gcc.exe` and
+`x86_64-w64-mingw32-gcc.exe`; they are the same linker driver, and its bundled
+notice states it cannot compile C:
+
+```text
+gcc.exe contained in this folder cannot be used for compiling C files - it is
+only used as a linker. In order to be able to compile projects containing C
+code use the GCC provided by MinGW or Cygwin.
+```
+
+Crates that compile C code through `cc` therefore fail even though a GCC
+binary exists under both names.
+
+Fix: point `cc` at a real MinGW or Cygwin GCC (for example, prefix the MSYS2
+`mingw64\bin` directory to `PATH` or set `CC`), or switch to the MSVC
+toolchain as the requirements section specifies.
+
+### Missing DLLs: `libintl-8.dll`, `libiconv-2.dll`, `zlib1.dll`, `libzstd.dll`
+
+If `as.exe` was copied into the self-contained directory (instead of using an
+MSYS2 `mingw64\bin` on `PATH`, which carries all of its runtime DLLs), it may
+still fail to start because it depends on `libintl-8.dll`, which depends on
+`libiconv-2.dll`; similar gaps appear for `zlib1.dll` and `libzstd.dll`.
+
+Fix: copy the runtime DLLs shipped by the matching MSYS2 packages
+(`mingw-w64-x86_64-gettext-runtime`, `mingw-w64-x86_64-libiconv`,
+`mingw-w64-x86_64-zlib`, `mingw-w64-x86_64-zstd`) into the self-contained
+directory, including transitive dependencies such as `libcharset-1.dll` and
+`libasprintf-0.dll`. To enumerate a binary's DLL imports and chase missing
+ones, run `llvm-objdump --private-headers <file>`; the rustup toolchain ships
+`llvm-objdump.exe` one directory above self-contained. Re-apply after
+`rustup update`.
+
+The MSVC toolchain (see Requirements) avoids this entire class of problems
+and remains the supported configuration for Windows builds.
+
+## Pinned Build Inputs and Source of Truth
+
+The following values are the repository build contract validated on September 27,
+2026. Keep these values synchronized with the referenced source files and CI
+workflows when changing a build dependency.
+
+| Input | Version or pin | Source of truth |
+| --- | --- | --- |
+| Flutter SDK | example/flutter-ohos, 3.41.10-ohos-0.0.2-beta.optimuse.1 | `apps/flutter/app/.fvmrc`, installed through FVM |
+| FVM | 4.3.0 | `FVM_VERSION` in the Flutter CI workflows; Dart pub global package |
+| Dart SDK | `^3.10.8` | `apps/flutter/app/pubspec.yaml`; supplied by the pinned Flutter SDK |
+| Rust toolchain | 1.95.0 | `RUST_TOOLCHAIN_VERSION` in `.github/workflows/`; rustup |
+| Node.js | 22 | `actions/setup-node` in the CI workflows |
+| Java | Temurin 17 | `actions/setup-java` in `.github/workflows/android-flutter-build.yml` |
+| Gradle | 8.14 | `apps/flutter/app/android/gradle/wrapper/gradle-wrapper.properties` |
+| Workflow package manager | pnpm 10.7.0 | `plugins/packages/buildin/workflow/package.json` |
+| Apple scientific-runtime host Python | 3.13 | `tools/ios-runtime/native/build_scientific.py` and `tools/ios-runtime/prepare.py` |
+
+Dependency source rules:
+
+- Dart dependency versions and hosted-package checksums are recorded in
+  `apps/flutter/app/pubspec.lock`. Hosted packages use `https://pub.dev`.
+- Local Dart packages are resolved from `apps/flutter/thirdparty`; Git Dart
+  packages use the repository URL and commit recorded in `pubspec.yaml` and
+  `pubspec.lock`.
+- Workflow JavaScript dependencies are pinned by `package.json` and resolved by
+  `plugins/packages/buildin/workflow/pnpm-lock.yaml`. The generated license
+  inventory is `resources/THIRD_PARTY_NOTICES.txt` and must be regenerated from
+  that lockfile, not edited by hand.
+- Native runtime source archives are declared by their fetch/build scripts with
+  an upstream URL and SHA-256 value. The script and its checksum are the source
+  of truth for the downloaded artifact.
+- CI runner images are part of the build environment: `ubuntu-24.04`,
+  `windows-2025`, and `macos-15` as declared by `.github/workflows/`.
+
+When a dependency or toolchain changes, update its lockfile or pinned source
+entry in the same change as this documentation. Merge conflicts in generated
+lockfiles must preserve both the dependency graph change and the repository's
+source policy.
+
+## iOS Runtime Source Pins
+
+The iOS runtime source set is reproducible from the pins in
+`tools/ios-runtime/ish/fetch_sources.py` and
+`tools/ios-runtime/ish/build_alpine_rootfs_linux.sh`:
+
+| Component | Pin | Source and integrity |
+| --- | --- | --- |
+| iSH | `7864dd601e615d0fc09b888a93d327f458b25a1d` | GitHub archive; SHA-256 is recorded in `fetch_sources.py` |
+| iSH libapps | `b8cacae35e5b11d64bb736a053921c16ca7faf9e` | GitHub archive; SHA-256 is recorded in `fetch_sources.py` |
+| iSH Linux | `8ec9bf17f89c6dba818f3ed2427de4223e78644a` | GitHub archive; SHA-256 is recorded in `fetch_sources.py` |
+| libarchive | `fc6563f5130d8a7ee1fc27c0e55baef35119f26c` | GitHub archive; SHA-256 is recorded in `fetch_sources.py` |
+| iSH Alpine rootfs | `g00712ff0a54b2839c5aa1a8ed758003ca65357dc` | GitHub release archive; SHA-256 is recorded in `build_alpine_rootfs_linux.sh` |
+| iSH Alpine repository | Alpine v3.19, x86 | `https://dl-cdn.alpinelinux.org/alpine/v3.19` |
+| uv | 0.12.1, i686 musl | GitHub release archive; SHA-256 is recorded in `build_alpine_rootfs_linux.sh` |
+| pnpm in iSH rootfs | 10.12.1 | npm registry archive; SHA-256 is recorded in `build_alpine_rootfs_linux.sh` |
+
+The iOS workflow runs on `macos-15` and records the installed Xcode SDK,
+Clang, Meson, and Ninja versions in its cache key. Keep those runner and source
+pins synchronized with `.github/workflows/ios-flutter-build.yml` and
+`.github/workflows/ios-app-package-build.yml`.
+## Built-In Workflow Plugin
+
+The workflow plugin is a pnpm project. Its `package.json` pins the package
+manager to pnpm 10.7.0; use Corepack so local commands honor that pin. The
+pnpm lockfile is the dependency source of truth. Do not use npm in this package.
+
+From the workflow package directory:
+
+```powershell
+corepack pnpm --version
+corepack pnpm install --frozen-lockfile
+corepack pnpm run pack:toolpkg
+corepack pnpm run test:web
+```
+
+`plugins/tools/sync_plugin_packages.py` invokes the package build through
+Corepack, so automated synchronization uses the version pinned in `package.json`.
+
+## Rust Targets
+
+Windows CLI release builds use:
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+rustup target add aarch64-pc-windows-msvc
+```
+
+Fedora WSL Linux CLI release builds use these Rust targets:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+rustup target add aarch64-unknown-linux-gnu
+sudo dnf install -y musl-gcc musl-devel musl-libc-static gcc-aarch64-linux-gnu sysroot-aarch64-fc43-glibc
+```
+
+The aarch64 Linux CLI release requires an `aarch64-linux-gnu-gcc` cross C compiler and
+the Fedora `/usr/aarch64-redhat-linux/sys-root/fc43` sysroot. The build release script injects
+the sysroot's `limits.h` while compiling C dependencies because Fedora's cross compiler
+is built without target headers.
+
+## Local CLI Checks
+
+Run from the repository root.
+
+```powershell
+cargo check --manifest-path apps/cli/Cargo.toml
+cargo run --manifest-path apps/cli/Cargo.toml --bin optimuse -- cli version
+```
+
+Run the TUI:
+
+```powershell
+cargo run --manifest-path apps/cli/Cargo.toml --bin optimuse -- tui
+```
+
+Run update checks:
+
+```powershell
+cargo run --manifest-path apps/cli/Cargo.toml --bin optimuse -- cli update target
+cargo run --manifest-path apps/cli/Cargo.toml --bin optimuse -- cli update check 0.0.0-preview.0
+cargo run --manifest-path apps/cli/Cargo.toml --bin optimuse -- tui --update-current-version 0.0.0-preview.0
+```
+
+## Build Release Script
+
+Interactive release helper:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\release_interactive.py
+```
+
+Direct build release script:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\build_release.py
+```
+
+Environment check only:
+
+```powershell
+.\.venv\Scripts\python.exe tools\build_scripts\build_local.py --products all --cli-arches host --check
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope full --cli-arches all --check-environment
+```
+
+Scopes:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope cli
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope app
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope full
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope none --no-wsl
+```
+
+Build only:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope cli
+```
+
+`tools/release/dist` is the shared staging directory for local, SSH-collected,
+and GitHub Actions assets. `build_release.py` keeps existing staged files so
+platform builds can be composed. Start a new staged set explicitly with:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope cli --clean-dist
+```
+
+Release environment assumptions:
+
+```text
+Local Windows build_release.py:
+  Builds Android, OpenHarmony, Windows App, Windows CLI, and WSL Linux assets.
+  Requires Windows build tools, Android/OpenHarmony signing files, and Fedora WSL
+  when WSL Linux assets are selected.
+
+Local build_local.py:
+  Builds only the current host App and/or CLI after checking the current host
+  requirements. macOS can add unsigned iOS with --include-ios.
+
+GitHub Actions:
+  Apple Release Build, macOS Flutter Build, iOS Flutter Build, Windows Release
+  Build, Linux Release Build, and Android Flutter Build are manual cloud
+  entrypoints. Artifacts downloaded from cloud runs are collected into
+  tools/release/dist with download_action_artifacts.py.
+```
+
+Cloud build composition:
+
+```text
+1. Trigger the platform workflows needed for this release.
+2. Wait for every selected workflow to succeed.
+3. Collect every run into tools/release/dist with one --run-id per run.
+4. Run publish_dist.py only when the collected files are ready to publish.
+```
+
+Successful App and full builds advance the Flutter build number in
+`apps/flutter/app/pubspec.yaml` after their assets are packaged. CLI-only builds do not
+change it.
+
+CLI architecture selection:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope cli --cli-arches host
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope cli --cli-arches all
+```
+
+On Windows, `--cli-arches all` builds:
+
+```text
+optimuse-cli-windows-x86_64.zip
+optimuse-cli-windows-aarch64.zip
+optimuse-cli-linux-x86_64.tar.gz
+optimuse-cli-linux-aarch64.tar.gz
+```
+
+Cloud workflows are independent manual `workflow_dispatch` entrypoints. The
+Apple aggregate workflow invokes the reusable macOS and iOS workflows; the
+other workflows build exactly one platform family:
+
+```text
+Apple Release Build       macOS App, macOS CLI, and unsigned iOS App
+macOS Flutter Build       macOS App and/or CLI
+iOS Flutter Build         unsigned iOS App
+Windows Release Build     Windows App and/or CLI
+Linux Release Build       Linux App and/or CLI
+Android Flutter Build     signed Android APKs
+```
+
+Android Flutter Build requires these repository secrets before it can run:
+
+```text
+ANDROID_RELEASE_KEYSTORE_BASE64
+ANDROID_RELEASE_STORE_PASSWORD
+ANDROID_RELEASE_KEY_ALIAS
+ANDROID_RELEASE_KEY_PASSWORD
+```
+
+`ANDROID_RELEASE_KEYSTORE_BASE64` is the Base64 encoding of the Android release
+keystore. The workflow writes the signing material only inside its runner.
+
+OpenHarmony has no GitHub Actions workflow yet. Its SDK and command-line tools
+are not currently distributed from a reproducible URL available to this
+repository, so a cloud workflow cannot provision a valid toolchain. The local
+OpenHarmony procedure below remains the supported build path until that SDK
+distribution source and the signing secrets are supplied.
+
+```powershell
+gh workflow run "Apple Release Build" -f products=all -f include_ios=true
+gh workflow run "macOS Flutter Build" -f products=all
+gh workflow run "iOS Flutter Build"
+gh workflow run "Windows Release Build" -f products=all -f cli_arches=all
+gh workflow run "Linux Release Build" -f products=all -f cli_arches=all
+gh workflow run "Android Flutter Build"
+.\.venv\Scripts\python.exe tools\release\download_action_artifacts.py --run-id <apple-run-id> --run-id <windows-run-id> --run-id <linux-run-id> --run-id <android-run-id>
+```
+
+`download_action_artifacts.py` accepts only completed successful runs and copies
+their release archives into the existing `tools/release/dist` staging directory.
+
+Collaborators can still build the current host locally with one Python command.
+Run it from the repository root. On Windows, use the project virtual environment.
+On macOS and Linux, use the active Python 3 environment.
+
+```powershell
+.\.venv\Scripts\python.exe tools\build_scripts\build_local.py --products all --cli-arches host
+```
+
+```bash
+python3 tools/build_scripts/build_local.py --products all --cli-arches host
+python3 tools/build_scripts/build_local.py --products app --include-ios
+```
+
+Local Apple builds require Xcode, Rust, FVM, Node/npm, and Python 3 on the macOS
+host. Apple outputs include:
+
+```text
+optimuse-app-macos-universal.zip
+optimuse-app-ios-arm64.zip
+optimuse-cli-macos-x86_64.tar.gz
+optimuse-cli-macos-aarch64.tar.gz
+```
+
+The output directory is:
+
+```text
+tools/release/dist
+```
+
+Each CLI archive contains:
+
+```text
+optimuse or optimuse.exe
+install.sh or install.bat
+uninstall.sh or uninstall.bat
+README.txt
+```
+
+Skip WSL Linux packaging:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\build_release.py --scope cli --cli-arches all --no-wsl
+```
+
+## Publishing
+
+Publish the already-built files in `tools/release/dist` to GitHub Release:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\publish_dist.py
+```
+
+Validate the staged files and GitHub credentials without uploading:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\publish_dist.py --check-only
+```
+
+Publish staged files as a draft:
+
+```powershell
+.\.venv\Scripts\python.exe tools\release\publish_dist.py --draft
+```
+
+The build release script reads versions from:
+
+```text
+apps/cli/Cargo.toml
+core/crates/optimuse-runtime/Cargo.toml
+apps/flutter/app/pubspec.yaml
+```
+
+Version, tag, build number, and updater asset rules are defined in:
+
+```text
+docs/release-versioning.md
+```
+
+## Flutter App
+
+The build release script builds app packages through Flutter. Local checks can be run from:
+
+```powershell
+cd apps\flutter\app
+fvm install --skip-pub-get
+fvm dart pub get --enforce-lockfile
+```
+
+### Dart Proxy Codegen
+
+`lib/core/proxy/generated/*.g.dart` is generated at build time and gitignored.
+The app build scripts (`build_flutter_android.py`, `build_flutter_ios.py`,
+`build_flutter_macos.py`) regenerate it before `pub get`. When you invoke
+`flutter build`, `flutter analyze`, or `fvm dart pub get` outside those scripts
+on a clean checkout, generate it first, or Dart analysis fails with
+`uri_has_not_been_generated` errors:
+
+```powershell
+cargo check --manifest-path core/crates/proxy/local/Cargo.toml --quiet
+```
+
+Run this from the repository root; the relative manifest path resolves against
+the current working directory.
+
+Windows app release build:
+
+```powershell
+fvm flutter build windows --release --no-pub --build-name 2.0.0 --build-number 1
+```
+
+Android release build requires signing values in:
+
+```text
+tools/release/secrets/android-signing.properties
+```
+
+Keep the Android release keystore and properties outside git and back them up:
+
+```text
+tools/release/secrets/optimuse-release.keystore
+tools/release/secrets/android-signing.properties
+```
+
+### Local Windows Android Build
+
+Building the Android APK outside CI needs extra prerequisites that the CI runners
+provide implicitly:
+
+1. **Developer Mode** (Settings → Privacy & security → For developers). FVM creates
+   a directory symbolic link for the pinned SDK (`.fvm/flutter_sdk`); without the
+   privilege `fvm install` fails with `errno 1314`. A directory junction is not a
+   substitute — the staging check uses `Path.is_symlink()`.
+2. **Host C compiler**. Build-dependency crates (`tree-sitter-*`, `ring`) compile C
+   for the host during `cargo build`; rustup's bundled `gcc.exe` cannot compile C
+   (see its bundled `GCC-WARNING.txt`). Install a full MinGW toolchain (for example
+   `scoop install mingw-winlibs`) or MSVC Build Tools, and make sure it is on `PATH`
+   **before** the Gradle daemon starts — the daemon caches the environment it was
+   launched with, so restart it (`Stop-Process` on `java`) after changing `PATH`.
+3. **pnpm 10.7.0 via corepack**. The plugin sync hook invokes `corepack pnpm`, and
+   the project pins `packageManager: pnpm@10.7.0`; other pnpm installations on
+   `PATH` (scoop/npm shims) shadow corepack and abort with a version check. Remove
+   or align those shims. The workflow plugin dependencies must be installed
+   before the Gradle plugin-sync hook runs:
+
+   ```powershell
+   cd plugins\packages\buildin\workflow
+   corepack pnpm install --frozen-lockfile
+   cd ..\..\..\..
+   ```
+
+4. **Android runtime (rootfs) artifacts**. `liboptimuse_busybox.so`, `liboptimuse_proot.so`,
+   and `rootfs.tar.gz.bin` are produced on CI by `tools/android-runtime/build_alpine_rootfs_wsl.sh`
+   and require WSL. Without them the Gradle check
+   (`requiredOptimuseAndroidRuntimeLibraries`) fails.
+
+5. **bindgen libclang**. The Rust bridge build runs bindgen for
+   `aarch64-linux-android` (`rquickjs-sys` with the `bindgen` feature), which
+   loads `libclang.dll` at build time. CI provisions it from nuget.org into
+   `target/optimuse-build-tools` (see `android-flutter-build.yml`); locally, either
+   place that package the same way or point the Gradle task at a full LLVM
+   install before the daemon starts. Without it the bridge build fails with
+   "Unable to find libclang".
+
+With the prerequisites in place:
+
+```powershell
+python tools\build_scripts\build_flutter_android.py --build-name 2.0.0 --build-number 11
+```
+
+The command runs the full chain (plugin packaging, Rust bridge cross-build,
+Gradle `assembleRelease`) and writes
+`tools/release/dist/optimuse-app-android-arm64-v8a.apk`. The NDK is provisioned
+automatically by the Android Gradle Plugin; `rustup target add aarch64-linux-android`
+is still required for the Rust bridge.
+
+Android Gradle selects the Rust bridge profile from the Android build variant:
+`debug` uses Cargo's `dev` profile and its `target/<rust-target>/debug` output;
+`profile` and `release` use `cargo build --release` and
+`target/<rust-target>/release`. JNI libraries are staged as variant-specific
+generated sources. The cached bridge in `src/main/jniLibs` is excluded from these
+sources so that a Release APK cannot package a previous Debug bridge.
+
+### Local Linux Android Build
+
+Linux hosts build the same chain with the NDK's `linux-x86_64` prebuilt toolchain
+(`*-clang` and `llvm-ar`, without the Windows `.cmd`/`.exe` suffixes). The Rust
+bridge binds `LIBCLANG_PATH` to `/usr/lib` by default, where most distributions
+install `libclang.so`; set `OPTIMUSE_LIBCLANG_DIR` to override it when libclang
+lives elsewhere. All other prerequisites are shared with the Windows list above:
+host C compiler, pnpm 10.7.0 via corepack, Web Access bundle, plugin packaging,
+and the Android runtime (rootfs) artifacts.
+
+```bash
+python tools/build_scripts/build_flutter_android.py --build-name 2.0.0 --build-number 11
+```
+
+## OpenHarmony Flutter App
+
+OpenHarmony builds require the OpenHarmony Flutter SDK maintained at:
+
+```text
+https://github.com/flutter-ohos/flutter-ohos.git
+```
+
+All platforms use the pinned Optimuse fork release **3.41.10-ohos-0.0.2-beta.optimuse.1** configured in
+`apps/flutter/app/.fvmrc`. FVM installs the tagged source at
+`.fvm/flutter_sdk`. The Windows engine cache uses the same version and downloads
+the Debug, Profile, and Release archives from the matching GitHub Release.
+After checkout, run `fvm install --skip-pub-get` and
+`fvm flutter precache --web --ohos` from `apps/flutter/app`.
+
+The user environment must provide:
+
+- FVM `4.3.0` through the Pub cache `bin` directory on `PATH`.
+- `dart` through a Flutter or Dart SDK `bin` directory on `PATH` so the FVM
+  launcher can start.
+- `OHOS_SDK_HOME` pointing to the OpenHarmony SDK root.
+- The selected OpenHarmony SDK `toolchains` directory on `PATH` for `hdc`.
+
+Restart the terminal or IDE after changing user environment variables so new
+processes inherit them.
+
+The Windows user environment used for local OpenHarmony builds should keep
+these values stable:
+
+```text
+HOS_SDK_HOME=%USERPROFILE%\harmony-tools\harmonyos-sdk
+OHOS_SDK_HOME=%USERPROFILE%\harmony-tools\harmonyos-sdk
+DEVECO_SDK_HOME=%USERPROFILE%\harmony-tools\harmonyos-sdk
+```
+
+Add these directories to the user `PATH`:
+
+```text
+%USERPROFILE%\harmony-tools\commandline-tools-2.0.0.2\command-line-tools\bin
+%USERPROFILE%\harmony-tools\ohcommandline-tools-2.0.0.2\oh-command-line-tools\bin
+%LOCALAPPDATA%\Pub\Cache\bin
+```
+
+The project-local OpenHarmony properties file should point at the same SDK and
+the FVM-selected Flutter SDK:
+
+```text
+apps/flutter/app/ohos/local.properties
+hwsdk.dir=<user-home>\\harmony-tools\\harmonyos-sdk
+flutter.sdk=<repo-root>\\apps\\flutter\\app\\.fvm\\flutter_sdk
+```
+
+The SDK root must contain a numeric API directory with all build components.
+The currently validated layout is:
+
+```text
+%USERPROFILE%\harmony-tools\harmonyos-sdk\18\ets
+%USERPROFILE%\harmony-tools\harmonyos-sdk\18\js
+%USERPROFILE%\harmony-tools\harmonyos-sdk\18\native
+%USERPROFILE%\harmony-tools\harmonyos-sdk\18\previewer
+%USERPROFILE%\harmony-tools\harmonyos-sdk\18\toolchains
+```
+
+Do not point this project at `%USERPROFILE%\harmony-tools\openharmony-sdk\9`;
+that older SDK does not match the current OpenHarmony API 18 project files.
+
+The FVM-selected SDK must expose the `ohos` platform and the `hap` build
+command. Verify the selected SDK and DevEco environment from the Flutter app
+directory:
+
+```powershell
+cd apps\flutter\app
+fvm install --skip-pub-get
+fvm flutter doctor -v
+fvm flutter config
+```
+
+`fvm flutter doctor -v` must report both Flutter and OpenHarmony toolchains.
+
+Generate the OpenHarmony application module once with the selected SDK:
+
+```powershell
+cd apps\flutter\app
+fvm flutter create --platforms ohos .
+```
+
+The Web frontend is the standard Flutter Web project under
+`apps/flutter/app/web`. The dedicated `Deploy Web Experience` GitHub Actions
+workflow still builds this frontend and publishes `apps/flutter/app/build/web`
+to the `gh-pages` branch for `web.example.com`.
+
+Build it locally with the same command used by GitHub Actions:
+
+```powershell
+cd apps\flutter\app
+fvm flutter build web --release --no-wasm-dry-run --base-href /
+```
+
+To trigger the GitHub Pages deployment manually:
+
+```powershell
+gh workflow run "Deploy Web Experience"
+```
+
+Native app and CLI release builds do not compile, copy, or package a Web
+frontend bundle. They expose only the Link Access service; users open
+`https://web.example.com/?accessUrl=...&token=...`.
+
+Build the OpenHarmony HAP with the repository script. The script invokes the
+same FVM-selected Flutter SDK and the OpenHarmony native toolchain:
+
+The Rust toolchain uses the native OpenHarmony target:
+
+```powershell
+rustup target add aarch64-unknown-linux-ohos
+```
+
+Build the HAP through the repository build script from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe tools\build_scripts\build_flutter_ohos.py --enforce-lockfile
+```
+
+The build script stages the Rust bridge, copies the OpenHarmony Flutter engine
+HAR files, patches the embedding HAR for the local API 18 SDK surface, clears
+the unpacked `ohpm` embedding package, runs `flutter build hap`, and signs the
+unsigned HAP with the project OpenHarmony release signing material in:
+
+```text
+tools/release/secrets/ohos-signing/ohos-signing.properties
+```
+
+Keep these OpenHarmony release signing files outside git and back them up:
+
+```text
+tools/release/secrets/ohos-signing/optimuse-ohos-release-app.p12
+tools/release/secrets/ohos-signing/optimuse-ohos-release-app.cer
+tools/release/secrets/ohos-signing/optimuse-ohos-release-profile.p12
+tools/release/secrets/ohos-signing/optimuse-ohos-release-profile.cer
+tools/release/secrets/ohos-signing/ohos-signing.properties
+```
+
+The generated per-build profile files are written under:
+
+```text
+apps/flutter/app/ohos/signing
+```
+
+That directory is ignored by git and should be treated as local build output.
+
+The signed build output is copied to:
+
+```text
+tools/release/dist/optimuse-app-ohos-arm64.hap
+```
+
+If the Flutter command reports `Can't load Kernel binary`, clear stale FVM or
+Flutter snapshot state for this app, run `fvm install --skip-pub-get` from
+`apps/flutter/app`, and run the OpenHarmony build script again from the
+repository root.
+
+## Useful Cleanup
+
+Remove release output:
+
+```powershell
+Remove-Item -Recurse -Force tools\release\dist, tools\release\work
+```
+
+Remove Rust build output for the CLI:
+
+```powershell
+Remove-Item -Recurse -Force apps\cli\target
+```
+
+Use cleanup commands only for build artifacts.

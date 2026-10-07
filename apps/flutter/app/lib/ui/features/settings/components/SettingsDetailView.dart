@@ -1,0 +1,56 @@
+// ignore_for_file: file_names
+
+import 'package:flutter/material.dart';
+
+import '../appearance/AppearanceSettingsPanel.dart';
+import '../access_links/AccessLinksSettingsPanel.dart';
+import '../about/AboutOptimuseScreen.dart';
+import '../characters/CharacterSettingsPanel.dart';
+import '../memory/MemorySettingsPanel.dart';
+import '../data/DataSettingsPanel.dart';
+import '../global_behavior/GlobalBehaviorSettingsPanel.dart';
+import '../model/ModelSettingsPanel.dart';
+import '../local_models/LocalModelSettingsPanel.dart';
+import '../models/SettingsModels.dart';
+import '../profile/UserProfileSettingsPanel.dart';
+import '../tools/ToolSettingsPanel.dart';
+import '../workspace/WorkspaceSettingsPanel.dart';
+
+class SettingsDetailView extends StatelessWidget {
+  const SettingsDetailView({
+    super.key,
+    required this.category,
+    required this.onOpenProfile,
+    this.showHeader = true,
+    this.onProfileChanged,
+  });
+
+  final SettingsCategory category;
+  final VoidCallback onOpenProfile;
+  final bool showHeader;
+  final VoidCallback? onProfileChanged;
+
+  /// Builds the settings panel selected by the navigation list.
+  @override
+  Widget build(BuildContext context) {
+    return switch (category) {
+      SettingsCategory.profile => UserProfileSettingsPanel(
+        onProfileChanged: onProfileChanged,
+      ),
+      SettingsCategory.model => const ModelSettingsPanel(),
+      SettingsCategory.localModels => const LocalModelSettingsPanel(),
+      SettingsCategory.tts => const ModelSettingsPanel(),
+      SettingsCategory.characters => const CharacterSettingsPanel(),
+      SettingsCategory.memory => const MemorySettingsPanel(),
+      SettingsCategory.tools => const ToolSettingsPanel(),
+      SettingsCategory.workspace => const WorkspaceSettingsPanel(),
+      SettingsCategory.globalBehavior => const GlobalBehaviorSettingsPanel(),
+      SettingsCategory.appearance => const AppearanceSettingsPanel(),
+      SettingsCategory.data => const DataSettingsPanel(),
+      SettingsCategory.accessLinks => AccessLinksSettingsPanel(
+        onOpenProfile: onOpenProfile,
+      ),
+      SettingsCategory.about => const AboutOptimuseScreen(),
+    };
+  }
+}

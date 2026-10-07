@@ -1,0 +1,79 @@
+use optimuse_host_api::HostManager::HostManager;
+use optimuse_tools::tools::packTool::RuntimePackageManager::RuntimePackageManager;
+use optimuse_tools::tools::AIToolHandler::AIToolHandler;
+
+/// Holds the ToolPkg execution dependencies owned by one runtime instance.
+#[derive(Clone)]
+pub struct ToolPkgBridgeRuntime {
+    tool_handler: AIToolHandler,
+    host_manager: HostManager,
+}
+
+impl ToolPkgBridgeRuntime {
+    /// Creates bridge runtime state for one application runtime.
+    pub fn new(tool_handler: AIToolHandler, host_manager: HostManager) -> Self {
+        Self {
+            tool_handler,
+            host_manager,
+        }
+    }
+
+    /// Returns a snapshot of this runtime's package manager.
+    pub fn package_manager(&self) -> RuntimePackageManager {
+        self.tool_handler
+            .getOrCreatePackageManager()
+            .lock()
+            .expect("package manager mutex poisoned")
+            .clone()
+    }
+
+    /// Returns this runtime's tool handler.
+    pub fn tool_handler(&self) -> AIToolHandler {
+        self.tool_handler.clone()
+    }
+
+    /// Returns the host capabilities attached to this ToolPkg runtime.
+    pub fn host_manager(&self) -> HostManager {
+        self.host_manager.clone()
+    }
+}
+
+/// Enqueues notifications in order on one Host-owned asynchronous consumer.
+pub fn scheduleToolPkgNotification(
+    task_name: &'static str,
+    task: impl FnOnce() -> optimuse_plugin_sdk::javascript::JsExecutionFuture<()> + Send + 'static,
+) {
+    type Notification =
+        Box<dyn FnOnce() -> optimuse_plugin_sdk::javascript::JsExecutionFuture<()> + Send>;
+    static QUEUE: std::sync::OnceLock<
+        Result<tokio::sync::mpsc::UnboundedSender<Notification>, String>,
+    > = std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Notification>();
+        optimuse_host_api::HostManager::defaultHostRuntimeTaskSchedulerHost()
+            .scheduleHostRuntimeAsyncTask(
+                "optimuse-toolpkg-notifications",
+                Box::new(move || {
+                    Box::pin(async move {
+                        while let Some(notification) = receiver.recv().await {
+                            notification().await;
+                        }
+                    })
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(sender)
+    });
+    let result = match queue {
+        Ok(sender) => sender
+            .send(Box::new(task))
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.clone()),
+    };
+    if let Err(error) = result {
+        optimuse_util::AppLogger::AppLogger::e(
+            "ToolPkgHookBridge",
+            &format!("enqueue {task_name} failed: {error}"),
+        );
+    }
+}

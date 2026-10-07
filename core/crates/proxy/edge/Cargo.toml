@@ -1,0 +1,18 @@
+[package]
+name = "optimuse-proxy-edge"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Typed proxy surface for Optimuse Edge Core services."
+
+[dependencies]
+async-trait.workspace = true
+optimuse-edge-contract = { path = "../../node/edge-contract" }
+optimuse-host-api = { path = "../../foundation/host-api" }
+optimuse-link = { path = "../../foundation/link" }
+serde.workspace = true
+
+[dev-dependencies]
+optimuse-node-edge = { path = "../../node/edge" }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }

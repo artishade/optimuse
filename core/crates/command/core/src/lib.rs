@@ -1,0 +1,37 @@
+#![allow(non_snake_case)]
+
+mod commands;
+mod output;
+
+pub use output::CoreCommandOutput;
+
+/// Creates an application from the provided context and runs a core command.
+pub async fn run_core_command_with_context(
+    context: optimuse_host_api::HostManager::HostManager,
+    args: &[String],
+) -> Result<CoreCommandOutput, String> {
+    let mut application =
+        optimuse_runtime::core::application::OptimuseApplication::OptimuseApplication::newWithContext(
+            context,
+        );
+    application.onCreate()?;
+    run_core_command(&mut application, args).await
+}
+
+/// Runs a core command against an already initialized application.
+pub async fn run_core_command(
+    application: &mut optimuse_runtime::core::application::OptimuseApplication::OptimuseApplication,
+    args: &[String],
+) -> Result<CoreCommandOutput, String> {
+    let jsonMode = args.iter().any(|arg| arg == "--json");
+    let commandArgs = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--json")
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut output = CoreCommandOutput::new();
+    output.setJsonMode(jsonMode);
+    commands::run_core_command(application, &commandArgs, &mut output).await?;
+    output.finalizeJson()?;
+    Ok(output)
+}

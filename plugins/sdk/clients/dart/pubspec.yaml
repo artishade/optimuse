@@ -1,0 +1,23 @@
+name: optimuse_plugin_sdk
+description: Plugin SDK client surface for third-party Optimuse integrations.
+version: 0.1.0
+
+environment:
+  sdk: ^3.10.8
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.4
+  msgpack_dart: ^1.0.1
+
+dev_dependencies:
+  test: ^1.26.2
+  lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: optimuse.plugin.sdk.flutter
+        pluginClass: OptimusePluginSdkFlutterPlugin

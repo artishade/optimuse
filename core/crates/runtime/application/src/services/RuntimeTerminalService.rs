@@ -1,0 +1,567 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use optimuse_host_api::{
+    HostRuntimeTaskSchedulerHost, TerminalHost, TerminalInfo, TerminalSessionListEntry,
+    TerminalTypeInfo,
+};
+use optimuse_store::{
+    PreferencesDataStore::{mutableStateFlow, MutableStateFlow, StateFlow},
+    RuntimeStorePaths::RuntimeStorePaths,
+};
+use serde::{Deserialize, Serialize};
+
+use optimuse_host_api::HostManager::HostManager;
+use optimuse_tools::files::PathMapper::PathMapper;
+use optimuse_tools::files::VisualFileSystem::VisualFileSystem;
+use optimuse_util::stream::HotStream::MutableSharedStreamImpl;
+use optimuse_util::stream::Stream::{CollectFuture, Stream};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Published terminal session metadata for UI session lists.
+pub struct RuntimeTerminalSessionInfo {
+    pub sessionId: String,
+    pub sessionName: String,
+    pub platform: String,
+    pub terminal: String,
+    pub terminalType: String,
+    pub sessionKind: String,
+    pub workingDir: String,
+    pub commandRunning: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Current terminal screen snapshot returned by the host.
+pub struct RuntimeTerminalScreen {
+    pub sessionId: String,
+    pub platform: String,
+    pub terminal: String,
+    pub terminalType: String,
+    pub rows: i32,
+    pub cols: i32,
+    pub content: String,
+    pub commandRunning: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Describes one terminal type that may be created by the active host.
+pub struct RuntimeTerminalTypeInfo {
+    pub terminal: String,
+    pub terminalType: String,
+    pub available: bool,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Describes all terminal types exposed by the active host.
+pub struct RuntimeTerminalInfo {
+    pub platform: String,
+    pub terminal: String,
+    pub terminalType: String,
+    pub types: Vec<RuntimeTerminalTypeInfo>,
+}
+
+/// Facade over host terminal APIs and shared terminal output streams.
+pub struct RuntimeTerminalService {
+    terminalHost: Arc<dyn TerminalHost>,
+    context: HostManager,
+}
+
+#[derive(Clone, Debug)]
+/// Stream wrapper exposing PTY output to Kotlin-style collectors.
+pub struct RuntimeTerminalPtyOutputStream {
+    upstream: MutableSharedStreamImpl<String>,
+}
+
+impl RuntimeTerminalPtyOutputStream {
+    /// Wraps a shared PTY output stream.
+    pub fn new(upstream: MutableSharedStreamImpl<String>) -> Self {
+        Self { upstream }
+    }
+}
+
+impl Stream for RuntimeTerminalPtyOutputStream {
+    type Item = String;
+
+    /// Collects PTY output asynchronously until the host closes the stream.
+    fn collect<'a>(&'a mut self, collector: &'a mut dyn FnMut(Self::Item)) -> CollectFuture<'a> {
+        self.upstream.collect(collector)
+    }
+}
+
+#[derive(Clone)]
+struct TerminalPtyOutputEntry {
+    stream: MutableSharedStreamImpl<String>,
+}
+
+static TERMINAL_PTY_OUTPUT_STREAMS: OnceLock<Mutex<HashMap<String, TerminalPtyOutputEntry>>> =
+    OnceLock::new();
+static TERMINAL_SESSIONS_FLOW: OnceLock<MutableStateFlow<Vec<RuntimeTerminalSessionInfo>>> =
+    OnceLock::new();
+
+fn terminal_pty_output_streams() -> &'static Mutex<HashMap<String, TerminalPtyOutputEntry>> {
+    TERMINAL_PTY_OUTPUT_STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn terminal_sessions_flow() -> &'static MutableStateFlow<Vec<RuntimeTerminalSessionInfo>> {
+    TERMINAL_SESSIONS_FLOW.get_or_init(|| mutableStateFlow(Vec::new()))
+}
+
+fn runtime_terminal_session_info(session: TerminalSessionListEntry) -> RuntimeTerminalSessionInfo {
+    RuntimeTerminalSessionInfo {
+        sessionId: session.sessionId,
+        sessionName: session.sessionName,
+        platform: session.platform,
+        terminal: session.terminal,
+        terminalType: session.terminalType,
+        sessionKind: session.sessionKind,
+        workingDir: session.workingDir,
+        commandRunning: session.commandRunning,
+    }
+}
+
+/// Converts one host terminal type descriptor into the Core proxy model.
+fn runtime_terminal_type_info(terminal_type: TerminalTypeInfo) -> RuntimeTerminalTypeInfo {
+    RuntimeTerminalTypeInfo {
+        terminal: terminal_type.terminal,
+        terminalType: terminal_type.terminalType,
+        available: terminal_type.available,
+        description: terminal_type.description,
+    }
+}
+
+/// Converts one host terminal capability descriptor into the Core proxy model.
+fn runtime_terminal_info(info: TerminalInfo) -> RuntimeTerminalInfo {
+    RuntimeTerminalInfo {
+        platform: info.platform,
+        terminal: info.terminal,
+        terminalType: info.terminalType,
+        types: info
+            .types
+            .into_iter()
+            .map(runtime_terminal_type_info)
+            .collect(),
+    }
+}
+
+fn load_terminal_sessions(
+    terminalHost: &dyn TerminalHost,
+) -> Result<Vec<RuntimeTerminalSessionInfo>, String> {
+    terminalHost
+        .listSessions()
+        .map_err(|error| error.message)
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .map(runtime_terminal_session_info)
+                .collect()
+        })
+}
+
+fn publish_terminal_sessions(
+    terminalHost: &dyn TerminalHost,
+) -> Result<Vec<RuntimeTerminalSessionInfo>, String> {
+    let sessions = load_terminal_sessions(terminalHost)?;
+    terminal_sessions_flow().set_value(sessions.clone());
+    Ok(sessions)
+}
+
+/// Publishes the current terminal session snapshot for non-service terminal callers.
+pub fn publish_terminal_sessions_for_host(
+    terminalHost: &dyn TerminalHost,
+) -> Result<Vec<RuntimeTerminalSessionInfo>, String> {
+    publish_terminal_sessions(terminalHost)
+}
+
+fn close_terminal_pty_output_stream(sessionId: &str) {
+    let entry = terminal_pty_output_streams()
+        .lock()
+        .expect("terminal pty output streams mutex poisoned")
+        .remove(sessionId);
+    if let Some(entry) = entry {
+        entry.stream.close();
+    }
+}
+
+fn start_terminal_pty_output_reader(
+    terminalHost: Arc<dyn TerminalHost>,
+    taskScheduler: Arc<dyn HostRuntimeTaskSchedulerHost>,
+    sessionId: String,
+    stream: MutableSharedStreamImpl<String>,
+) {
+    let scheduledTaskScheduler = taskScheduler.clone();
+    taskScheduler
+        .scheduleHostRuntimeAsyncTask(
+            "optimuse-terminal-pty-output",
+            Box::new(move || Box::pin(async move {
+                // Keep one request thread and yield to the shared timer instead
+                // of creating a new OS thread for every 40 ms polling turn.
+                while poll_terminal_pty_output(terminalHost.as_ref(), &sessionId, &stream) {
+                    if scheduledTaskScheduler.waitForHostRuntimeDelay(40).await.is_err() {
+                        close_terminal_pty_output_stream(&sessionId);
+                        break;
+                    }
+                }
+            })),
+        )
+        .expect("terminal PTY output task must be scheduled");
+}
+
+/// Reads one batch; false terminates the session's single asynchronous reader.
+fn poll_terminal_pty_output(
+    terminalHost: &dyn TerminalHost,
+    sessionId: &str,
+    stream: &MutableSharedStreamImpl<String>,
+) -> bool {
+    if !terminal_pty_output_streams()
+        .lock()
+        .expect("terminal pty output streams mutex poisoned")
+        .contains_key(sessionId)
+    {
+        return false;
+    }
+    match terminalHost.readPtySession(sessionId) {
+        Ok(data) if !data.is_empty() => stream.emit(STANDARD.encode(data)),
+        Ok(_) => {}
+        Err(_) => {
+            close_terminal_pty_output_stream(sessionId);
+            return false;
+        }
+    }
+
+    match terminalHost.pollPtyExitCode(sessionId) {
+        Ok(Some(_)) => {
+            // Drain bytes arriving between the read and the exit observation.
+            if let Ok(data) = terminalHost.readPtySession(sessionId) {
+                if !data.is_empty() { stream.emit(STANDARD.encode(data)); }
+            }
+            publish_terminal_sessions(terminalHost)
+                .expect("TerminalHost.listSessions must succeed after PTY exit");
+            close_terminal_pty_output_stream(sessionId);
+            false
+        }
+        Ok(None) => true,
+        Err(_) => {
+            close_terminal_pty_output_stream(sessionId);
+            false
+        }
+    }
+}
+
+impl RuntimeTerminalService {
+    #[allow(non_snake_case)]
+    /// Creates a terminal service from application host context.
+    pub fn getInstance(context: &HostManager) -> Self {
+        Self {
+            terminalHost: context
+                .terminalHost
+                .clone()
+                .expect("TerminalHost must be configured for RuntimeTerminalService"),
+            context: context.clone(),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    /// Lists terminal sessions currently known by the host.
+    pub fn listTerminalSessions(&self) -> Result<Vec<RuntimeTerminalSessionInfo>, String> {
+        publish_terminal_sessions(self.terminalHost.as_ref())
+    }
+
+    #[allow(non_snake_case)]
+    /// Returns a state flow of published terminal sessions.
+    pub fn terminalSessionsFlow(
+        &self,
+    ) -> Result<StateFlow<Vec<RuntimeTerminalSessionInfo>>, String> {
+        publish_terminal_sessions(self.terminalHost.as_ref())?;
+        Ok(terminal_sessions_flow().asStateFlow())
+    }
+
+    #[allow(non_snake_case)]
+    /// Returns the host-declared terminal type for manual PTY creation.
+    pub fn defaultTerminalType(&self) -> Result<String, String> {
+        self.terminalHost
+            .terminalInfo()
+            .map(|info| info.terminalType)
+            .map_err(|error| error.message)
+    }
+
+    #[allow(non_snake_case)]
+    /// Returns every terminal type that the active host exposes to users.
+    pub fn terminalInfo(&self) -> Result<RuntimeTerminalInfo, String> {
+        self.terminalHost
+            .terminalInfo()
+            .map(runtime_terminal_info)
+            .map_err(|error| error.message)
+    }
+
+    #[allow(non_snake_case)]
+    /// Starts a PTY terminal session and attaches its output stream.
+    pub fn startTerminalPty(
+        &self,
+        sessionName: String,
+        terminal: String,
+        terminalType: String,
+        workingDir: String,
+        rows: i32,
+        cols: i32,
+    ) -> Result<String, String> {
+        let resolvedWorkingDir = self
+            .terminalHost
+            .resolveWorkingDirectory(
+                &terminal,
+                &terminalType,
+                &workingDir,
+                &|path| resolve_terminal_working_dir(&self.context, path)
+                    .map_err(optimuse_host_api::HostError::new),
+            )
+            .map_err(|error| format!(
+                "Cannot resolve terminal working directory for {terminal}/{terminalType} at {workingDir}: {}",
+                error.message,
+            ))?;
+        let sessionId = self
+            .terminalHost
+            .startPtySession(
+                &sessionName,
+                &terminal,
+                &terminalType,
+                &resolvedWorkingDir,
+                rows as u16,
+                cols as u16,
+            )
+            .map_err(|error| error.message)?;
+        self.ensureTerminalPtyOutputStream(sessionId.clone());
+        publish_terminal_sessions(self.terminalHost.as_ref())?;
+        Ok(sessionId)
+    }
+
+    #[allow(non_snake_case)]
+    /// Returns the shared output stream for a PTY session.
+    pub fn terminalPtyOutput(&self, sessionId: String) -> RuntimeTerminalPtyOutputStream {
+        RuntimeTerminalPtyOutputStream::new(self.ensureTerminalPtyOutputStream(sessionId))
+    }
+
+    #[allow(non_snake_case)]
+    /// Writes base64-encoded bytes to a PTY session.
+    pub fn writeTerminalPty(&self, sessionId: String, dataBase64: String) -> Result<i32, String> {
+        let data = STANDARD
+            .decode(dataBase64.as_bytes())
+            .map_err(|error| error.to_string())?;
+        self.terminalHost
+            .writePtySession(&sessionId, &data)
+            .map(|count| count as i32)
+            .map_err(|error| error.message)
+    }
+
+    #[allow(non_snake_case)]
+    /// Resizes a PTY session.
+    pub fn resizeTerminalPty(&self, sessionId: String, rows: i32, cols: i32) -> Result<(), String> {
+        self.terminalHost
+            .resizePtySession(&sessionId, rows as u16, cols as u16)
+            .map_err(|error| error.message)
+    }
+
+    #[allow(non_snake_case)]
+    /// Polls the exit code for a PTY session.
+    pub fn pollTerminalPtyExit(&self, sessionId: String) -> Result<Option<i32>, String> {
+        self.terminalHost
+            .pollPtyExitCode(&sessionId)
+            .map_err(|error| error.message)
+    }
+
+    #[allow(non_snake_case)]
+    /// Closes a PTY session and removes its output stream.
+    pub fn closeTerminalPty(&self, sessionId: String) -> Result<(), String> {
+        close_terminal_pty_output_stream(&sessionId);
+        self.terminalHost
+            .closePtySession(&sessionId)
+            .map_err(|error| error.message)?;
+        publish_terminal_sessions(self.terminalHost.as_ref())?;
+        Ok(())
+    }
+
+    #[allow(non_snake_case)]
+    /// Sends text input to a terminal session.
+    pub fn inputTerminalSession(&self, sessionId: String, input: String) -> Result<i32, String> {
+        self.terminalHost
+            .inputInSession(&sessionId, Some(&input), None)
+            .map(|output| output.acceptedChars as i32)
+            .map_err(|error| error.message)
+    }
+
+    #[allow(non_snake_case)]
+    /// Reads the current screen contents for a terminal session.
+    pub fn getTerminalSessionScreen(
+        &self,
+        sessionId: String,
+    ) -> Result<RuntimeTerminalScreen, String> {
+        self.terminalHost
+            .getSessionScreen(&sessionId)
+            .map_err(|error| error.message)
+            .map(|screen| RuntimeTerminalScreen {
+                sessionId: screen.sessionId,
+                platform: screen.platform,
+                terminal: screen.terminal,
+                terminalType: screen.terminalType,
+                rows: screen.rows as i32,
+                cols: screen.cols as i32,
+                content: screen.content,
+                commandRunning: screen.commandRunning,
+            })
+    }
+
+    #[allow(non_snake_case)]
+    fn ensureTerminalPtyOutputStream(&self, sessionId: String) -> MutableSharedStreamImpl<String> {
+        let mut streams = terminal_pty_output_streams()
+            .lock()
+            .expect("terminal pty output streams mutex poisoned");
+        if let Some(entry) = streams.get(&sessionId) {
+            return entry.stream.clone();
+        }
+        let stream = MutableSharedStreamImpl::new(512);
+        streams.insert(
+            sessionId.clone(),
+            TerminalPtyOutputEntry {
+                stream: stream.clone(),
+            },
+        );
+        let taskScheduler = self
+            .context
+            .hostRuntimeTaskSchedulerHost
+            .clone()
+            .expect("RuntimeTerminalService requires a HostRuntimeTaskSchedulerHost");
+        start_terminal_pty_output_reader(
+            self.terminalHost.clone(),
+            taskScheduler,
+            sessionId,
+            stream.clone(),
+        );
+        stream
+    }
+}
+
+/// Resolves host-owned directories after the selected terminal has dispatched its namespace.
+fn resolve_terminal_working_dir(context: &HostManager, workingDir: &str) -> Result<String, String> {
+    let trimmed = workingDir.trim();
+    if trimmed == "/app" || trimmed.starts_with("/app/")
+        || trimmed == "/mnt" || trimmed.starts_with("/mnt/")
+    {
+        return terminal_vfs(context)?
+            .resolvePath(trimmed)
+            .and_then(|path| path.nativePath());
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Builds the host VFS used only for directories owned by the current runtime.
+fn terminal_vfs(context: &HostManager) -> Result<VisualFileSystem, String> {
+    let runtimeStorageHost = context.runtimeStorageHost.as_ref().ok_or_else(|| {
+        "RuntimeStorageHost is not configured for terminal working directory".to_string()
+    })?;
+    let runtimeStoreRoot = runtimeStorageHost.runtimeRootDir().ok_or_else(|| {
+        "RuntimeStorageHost runtime root is not configured for terminal working directory"
+            .to_string()
+    })?;
+    let workspaceCollectionRoot = runtimeStorageHost.workspaceRootDir().ok_or_else(|| {
+        "RuntimeStorageHost workspace root is not configured for terminal working directory"
+            .to_string()
+    })?;
+    Ok(VisualFileSystem::new(
+        context.fileSystemHost.clone().ok_or_else(|| {
+            "FileSystemHost is not registered for terminal working directory".to_string()
+        })?,
+        PathMapper::new(runtimeStoreRoot, workspaceCollectionRoot),
+    ))
+}
+
+#[cfg(test)]
+mod idle_poll_tests {
+    use super::*;
+    use optimuse_host_api::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestTerminal { reads: AtomicUsize, exited: bool }
+    #[allow(unused_variables)]
+    impl TerminalHost for TestTerminal {
+        /// Resolves host directories without changing this stream-test host's capabilities.
+        fn resolveWorkingDirectory(
+            &self,
+            _: &str,
+            _: &str,
+            workingDir: &str,
+            resolveHostDirectory: &dyn Fn(&str) -> HostResult<String>,
+        ) -> HostResult<String> {
+            resolveHostDirectory(workingDir)
+        }
+        fn terminalInfo(&self) -> HostResult<TerminalInfo> { unimplemented!() }
+        fn startPtySession(
+        &self,
+        sessionName: &str,
+        terminal: &str,
+        terminalType: &str,
+        workingDir: &str,
+        rows: u16,
+        cols: u16,
+    ) -> HostResult<String> { unimplemented!() }
+        fn readPtySession(&self, sessionId: &str) -> HostResult<Vec<u8>> { let read = self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(if self.exited { if read == 0 { b"before".to_vec() } else { b"tail".to_vec() } } else { Vec::new() }) }
+        fn writePtySession(&self, sessionId: &str, data: &[u8]) -> HostResult<usize> { unimplemented!() }
+        fn resizePtySession(&self, sessionId: &str, rows: u16, cols: u16) -> HostResult<()> { unimplemented!() }
+        fn pollPtyExitCode(&self, sessionId: &str) -> HostResult<Option<i32>> { Ok(if self.exited { Some(0) } else { None }) }
+        fn closePtySession(&self, sessionId: &str) -> HostResult<()> { unimplemented!() }
+        fn listSessions(&self) -> HostResult<Vec<TerminalSessionListEntry>> { Ok(Vec::new()) }
+        fn createOrGetSession(&self, sessionName: &str) -> HostResult<TerminalSessionInfo> { unimplemented!() }
+        /// Rejects typed session creation in this output-stream-only test host.
+        fn createOrGetTypedSession(&self, _: &str, _: &str) -> HostResult<TerminalSessionInfo> { unimplemented!() }
+        fn executeInSession(
+        &self,
+        sessionId: &str,
+        command: &str,
+        timeoutMs: u64,
+    ) -> HostResult<TerminalCommandOutput> { unimplemented!() }
+        fn executeHiddenCommand(
+        &self,
+        command: &str,
+        executorKey: &str,
+        timeoutMs: u64,
+    ) -> HostResult<HiddenTerminalCommandOutput> { unimplemented!() }
+        fn inputInSession(
+        &self,
+        sessionId: &str,
+        input: Option<&str>,
+        control: Option<&str>,
+    ) -> HostResult<TerminalInputOutput> { unimplemented!() }
+        fn closeSession(&self, sessionId: &str) -> HostResult<TerminalCloseOutput> { unimplemented!() }
+        fn getSessionScreen(&self, sessionId: &str) -> HostResult<TerminalScreenOutput> { unimplemented!() }
+    }
+
+    fn register(id: &str) -> MutableSharedStreamImpl<String> {
+        let stream = MutableSharedStreamImpl::new(8);
+        terminal_pty_output_streams().lock().unwrap().insert(
+            id.to_owned(), TerminalPtyOutputEntry { stream: stream.clone() });
+        stream
+    }
+
+    #[test]
+    fn closed_reader_stops_without_touching_host() {
+        let id = "idle-poll-test-close";
+        let stream = register(id);
+        let host = TestTerminal { reads: AtomicUsize::new(0), exited: false };
+        assert!(poll_terminal_pty_output(&host, id, &stream));
+        close_terminal_pty_output_stream(id);
+        assert!(!poll_terminal_pty_output(&host, id, &stream));
+        assert_eq!(host.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exit_drains_final_bytes_before_closing() {
+        let id = "idle-poll-test-exit";
+        let stream = register(id);
+        let host = TestTerminal { reads: AtomicUsize::new(0), exited: true };
+        assert!(!poll_terminal_pty_output(&host, id, &stream));
+        assert_eq!(stream.replay_cache(), vec![STANDARD.encode(b"before"), STANDARD.encode(b"tail")]);
+        assert!(!poll_terminal_pty_output(&host, id, &stream));
+        assert_eq!(host.reads.load(Ordering::SeqCst), 2);
+    }
+}

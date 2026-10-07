@@ -1,0 +1,19 @@
+[package]
+name = "optimuse-model"
+version = "2.0.0-preview.14"
+edition.workspace = true
+license.workspace = true
+publish = true
+description = "Shared data models and transport structures for Optimuse."
+readme = "README.md"
+repository = "https://github.com/example/Optimuse"
+documentation = "https://docs.rs/optimuse-model"
+
+[dependencies]
+chrono.workspace = true
+optimuse-host-api = { version = "0.1.0", path = "../host-api" }
+optimuse-link = { path = "../link" }
+optimuse-util = { version = "2.0.0-preview.14", path = "../util" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

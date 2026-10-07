@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "rootDir": ".",
+    "outDir": "web",
+    "removeComments": true,
+    "strict": false,
+    "noImplicitAny": true,
+    "noEmitOnError": true,
+    "skipLibCheck": true
+  },
+  "include": [
+    "optimuse_runtime_bridge.ts",
+    "optimuse_runtime_worker.ts",
+    "optimuse_model_install_worker.ts",
+    "v86_runtime_worker.ts"
+  ]
+}

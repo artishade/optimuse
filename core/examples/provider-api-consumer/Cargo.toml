@@ -1,0 +1,13 @@
+[package]
+name = "optimuse-provider-api-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Third-party provider implementation example for optimuse-providers"
+
+[workspace]
+
+[dependencies]
+optimuse-providers = { path = "../../crates/provider/services" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt"] }

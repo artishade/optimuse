@@ -1,0 +1,143 @@
+
+import { FlutterAbility, FlutterEngine } from '@ohos/flutter_ohos';
+import promptAction from '@ohos.promptAction';
+import window from '@ohos.window';
+import bundleManager from '@ohos.bundle.bundleManager';
+import { GeneratedPluginRegistrant } from '../plugins/GeneratedPluginRegistrant';
+import MethodChannel from '@ohos/flutter_ohos/src/main/ets/plugin/common/MethodChannel';
+import Want from '@ohos.app.ability.Want';
+import AbilityConstant from '@ohos.app.ability.AbilityConstant';
+import { OptimuseRuntimeChannel } from './OptimuseRuntimeChannel';
+
+export default class EntryAbility extends FlutterAbility {
+  private optimuseRuntimeChannel: OptimuseRuntimeChannel | null = null;
+  private crashChannel: MethodChannel | null = null;
+  private themeChannel: MethodChannel | null = null;
+  private packageInfoChannel: MethodChannel | null = null;
+  private currentWindowStage: window.WindowStage | null = null;
+
+  /// Captures the notification activation that launched this application process.
+  onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    super.onCreate(want, launchParam)
+    this.recordNotificationActivation(want)
+  }
+
+  /// Captures a notification activation delivered to an already-running ability.
+  onNewWant(want: Want, launchParams: AbilityConstant.LaunchParam): void {
+    super.onNewWant(want, launchParams)
+    this.recordNotificationActivation(want)
+  }
+
+  /// Configures Flutter plugins and the Optimuse runtime channel.
+  configureFlutterEngine(flutterEngine: FlutterEngine) {
+    super.configureFlutterEngine(flutterEngine)
+    GeneratedPluginRegistrant.registerWith(flutterEngine)
+    this.registerPackageInfoChannel(flutterEngine)
+    this.themeChannel = new MethodChannel(flutterEngine.getDartExecutor(), 'optimuse/webview_theme')
+    // Updates ArkWeb preferences without overriding the application's system theme source.
+    this.themeChannel.setMethodCallHandler({
+      onMethodCall: (call, result): void => {
+        if (call.method !== 'setPreferredColorScheme') {
+          result.notImplemented()
+          return
+        }
+        const scheme = call.args as string
+        if (scheme !== 'dark' && scheme !== 'light') {
+          result.error('invalid_color_scheme', 'Expected dark or light', null)
+          return
+        }
+        AppStorage.setOrCreate<boolean>('optimuseWebViewDark', scheme === 'dark')
+        result.success(null)
+      }
+    })
+    const channel = new MethodChannel(flutterEngine.getDartExecutor(), 'optimuse/runtime')
+    this.optimuseRuntimeChannel = OptimuseRuntimeChannel.register(channel, this.context, this.currentWindowStage)
+    this.crashChannel = new MethodChannel(flutterEngine.getDartExecutor(), 'optimuse/crash')
+    this.crashChannel.setMethodCallHandler({
+      onMethodCall: (call, result): void => {
+        if (call.method !== 'present') {
+          result.notImplemented()
+          return
+        }
+        const details = call.argument('details') as string | null
+        if (details === null) {
+          result.error('INVALID_ARGS', 'present requires crash details', null)
+          return
+        }
+        promptAction.showDialog({
+          title: 'Optimuse has stopped',
+          message: details,
+          buttons: [{ text: 'Close', color: '#007DFF' }],
+        }).then((): void => {
+          result.success(null)
+        })
+      }
+    })
+  }
+
+  /// Implements the shared package_info_plus protocol using installed HAP metadata.
+  private registerPackageInfoChannel(flutterEngine: FlutterEngine): void {
+    this.packageInfoChannel = new MethodChannel(
+      flutterEngine.getDartExecutor(), 'dev.fluttercommunity.plus/package_info'
+    )
+    this.packageInfoChannel.setMethodCallHandler({
+      onMethodCall: (call, result): void => {
+        if (call.method !== 'getAll') {
+          result.notImplemented()
+          return
+        }
+        bundleManager.getBundleInfoForSelf(
+          bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION
+        ).then(async (info: bundleManager.BundleInfo): Promise<void> => {
+          const appName = await this.context.resourceManager.getStringValue(info.appInfo.labelId)
+          const metadata = new Map<string, Object>()
+          metadata.set('appName', appName)
+          metadata.set('packageName', info.name)
+          metadata.set('version', info.versionName)
+          metadata.set('buildNumber', info.versionCode.toString())
+          result.success(metadata)
+        }).catch((error: Object): void => {
+          result.error('PACKAGE_INFO_ERROR', `${error}`, null)
+        })
+      }
+    })
+  }
+
+  /// Stores the active WindowStage for host screenshot capture.
+  onWindowStageCreate(windowStage: window.WindowStage): void {
+    super.onWindowStageCreate(windowStage)
+    this.currentWindowStage = windowStage
+    this.optimuseRuntimeChannel?.setWindowStage(windowStage)
+  }
+
+  /// Clears the WindowStage reference after the ability window is destroyed.
+  onWindowStageDestroy(): void {
+    this.currentWindowStage = null
+    this.optimuseRuntimeChannel?.setWindowStage(null)
+    super.onWindowStageDestroy()
+  }
+
+  /// Releases the native Optimuse runtime bridge.
+  onDestroy(): void {
+    this.packageInfoChannel?.setMethodCallHandler(null)
+    this.packageInfoChannel = null
+    this.themeChannel?.setMethodCallHandler(null)
+    this.themeChannel = null
+    this.crashChannel?.setMethodCallHandler(null)
+    this.crashChannel = null
+    this.optimuseRuntimeChannel?.destroy()
+    this.optimuseRuntimeChannel = null
+    super.onDestroy()
+  }
+
+  /// Parses and forwards the Optimuse notification activation embedded in one Want.
+  private recordNotificationActivation(want: Want): void {
+    const parameters = want.parameters as Record<string, Object> | undefined
+    const encodedActivation = parameters?.['optimuseNotificationActivation']
+    if (typeof encodedActivation !== 'string') {
+      return
+    }
+    const activation = JSON.parse(encodedActivation) as Record<string, Object>
+    OptimuseRuntimeChannel.receiveNotificationActivation(activation)
+  }
+}

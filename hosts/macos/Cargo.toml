@@ -1,0 +1,12 @@
+[package]
+name = "optimuse-host-macos-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+optimuse-host-apple-native = { path = "../apple" }
+optimuse-host-api = { path = "../../core/crates/foundation/host-api" }
+optimuse-host-native-common = { path = "../common/optimuse-host-native-common", default-features = false, features = ["tcp", "serial", "storage"] }
+optimuse-host-native-plugin-sdk-ipc = { path = "../common/optimuse-host-native-plugin-sdk-ipc" }

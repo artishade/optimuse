@@ -1,0 +1,25 @@
+[package]
+name = "optimuse-js-bridge"
+version = "2.0.0-preview.14"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+aes = "0.8"
+base64.workspace = true
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+md-5 = "0.10"
+optimuse-host-api = { path = "../../foundation/host-api" }
+optimuse-plugin-sdk = { path = "../sdk" }
+optimuse-store = { path = "../../persistence/store" }
+optimuse-util = { path = "../../foundation/util" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+uuid = { workspace = true, features = ["js"] }
+
+[dev-dependencies]
+optimuse-host-native-scheduler = { path = "../../../../hosts/common/optimuse-host-native-scheduler" }
+zip.workspace = true
