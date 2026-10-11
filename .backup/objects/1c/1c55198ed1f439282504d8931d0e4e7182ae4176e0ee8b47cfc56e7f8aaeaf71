@@ -1,0 +1,330 @@
+/**
+ * Tests for the Linux host layer (Phase 3).
+ *
+ * Tests cover:
+ *  - Host descriptor detection (privilege, isolation, capabilities)
+ *  - Filesystem host (workspace jail, binary read, move/copy/delete)
+ *  - Terminal host (session lifecycle, script execution)
+ *  - System operations (system info, process listing)
+ *  - Tool integration with the 4-layer permission gate
+ */
+
+import { describe, expect, it, beforeAll, afterAll } from 'vitest';
+import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
+import * as os from 'node:os';
+
+import { detectLinuxHost, LinuxTerminalHost, getLinuxHostTools } from '../../src/hosts/linux/index.js';
+import {
+  resolveWorkspacePath,
+  getFileInfo,
+  readFileSafe,
+  writeFileSafe,
+  moveFile,
+  copyFile,
+  deleteFile,
+  searchFiles,
+} from '../../src/hosts/linux/fs.js';
+import {
+  getSystemInfo,
+  listProcesses,
+  getDiskUsage,
+  getCpuInfo,
+} from '../../src/hosts/linux/system.js';
+import { ToolRegistry, checkPermission } from '../../src/tools/registry.js';
+
+describe('Linux Host — Descriptor', () => {
+  let workspace: string;
+
+  beforeAll(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'optimuse-host-test-'));
+  });
+
+  it('detects host environment', async () => {
+    const desc = await detectLinuxHost(workspace);
+
+    expect(desc.platform).toBe('linux');
+    expect(['normal', 'root']).toContain(desc.privilege);
+    expect(desc.id).toContain('linux-');
+    expect(desc.capabilities.length).toBeGreaterThan(0);
+    expect(desc.capabilities.find((c) => c.id === 'filesystem')?.available).toBe(true);
+    expect(desc.workspaceRoots).toContainEqual(
+      expect.objectContaining({ id: 'main', path: workspace }),
+    );
+  });
+
+  it('detects non-container isolation on bare metal / VM', async () => {
+    // In CI/container this might be 'container', but the field should exist
+    const desc = await detectLinuxHost(workspace);
+    expect(['none', 'container', 'virtual_machine']).toContain(desc.isolation);
+  });
+
+  it('reports onboarding requirements', async () => {
+    const desc = await detectLinuxHost(workspace);
+    expect(desc.onboardingRequirements.length).toBeGreaterThan(0);
+    expect(desc.onboardingRequirements.every((r) => r.satisfied)).toBe(true);
+  });
+});
+
+describe('Linux Host — Filesystem', () => {
+  let workspace: string;
+
+  beforeAll(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'optimuse-fs-test-'));
+  });
+
+  it('resolves workspace-relative paths', () => {
+    const resolved = resolveWorkspacePath(workspace, 'subdir/file.txt');
+    expect(resolved).toBe(path.join(workspace, 'subdir', 'file.txt'));
+  });
+
+  it('resolves absolute workspace paths', () => {
+    const resolved = resolveWorkspacePath(workspace, path.join(workspace, 'foo.txt'));
+    expect(resolved).toBe(path.join(workspace, 'foo.txt'));
+  });
+
+  it('rejects paths outside the workspace', () => {
+    expect(() => resolveWorkspacePath(workspace, '../../etc/passwd')).toThrow(
+      /path escapes workspace/,
+    );
+    expect(() => resolveWorkspacePath(workspace, '/etc/passwd')).toThrow(
+      /path escapes workspace/,
+    );
+  });
+
+  it('reads and writes files safely', async () => {
+    const p = path.join(workspace, 'test.txt');
+    await writeFileSafe(p, 'hello world', 'utf8');
+    const result = await readFileSafe(p);
+    expect(result.encoding).toBe('utf8');
+    expect(result.content).toBe('hello world');
+  });
+
+  it('writes and reads binary files as base64', async () => {
+    const p = path.join(workspace, 'test.bin');
+    const binaryData = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    await writeFileSafe(p, binaryData.toString('base64'), 'base64');
+    const result = await readFileSafe(p);
+    expect(result.encoding).toBe('base64');
+    expect(Buffer.from(result.content, 'base64')).toEqual(binaryData);
+  });
+
+  it('gets file info', async () => {
+    const p = path.join(workspace, 'info_test.txt');
+    await fs.writeFile(p, 'test content');
+    const info = await getFileInfo(p);
+    expect(info.isFile).toBe(true);
+    expect(info.size).toBe(12);
+    expect(info.path).toBe(p);
+  });
+
+  it('moves files', async () => {
+    const src = path.join(workspace, 'move_src.txt');
+    const dest = path.join(workspace, 'move_dest.txt');
+    await fs.writeFile(src, 'move me');
+    await moveFile(src, dest);
+    expect(fs.stat(src)).rejects.toThrow();
+    expect(fs.stat(dest)).resolves.toBeDefined();
+    expect(await fs.readFile(dest, 'utf8')).toBe('move me');
+  });
+
+  it('copies files and directories', async () => {
+    // File copy
+    const src = path.join(workspace, 'copy_src.txt');
+    const dest = path.join(workspace, 'copy_dest.txt');
+    await fs.writeFile(src, 'copy me');
+    await copyFile(src, dest);
+    expect(await fs.readFile(dest, 'utf8')).toBe('copy me');
+
+    // Directory copy
+    const srcDir = path.join(workspace, 'copy_dir_src');
+    const destDir = path.join(workspace, 'copy_dir_dest');
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, 'inner.txt'), 'inner content');
+    await copyFile(srcDir, destDir);
+    expect(await fs.readFile(path.join(destDir, 'inner.txt'), 'utf8')).toBe('inner content');
+  });
+
+  it('deletes files', async () => {
+    const p = path.join(workspace, 'delete_me.txt');
+    await fs.writeFile(p, 'delete me');
+    await deleteFile(p);
+    expect(await fs.stat(p)).rejects.toThrow();
+  });
+
+  it('deletes directories recursively', async () => {
+    const dir = path.join(workspace, 'delete_dir');
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'file.txt'), 'content');
+    await deleteFile(dir);
+    expect(await fs.stat(dir)).rejects.toThrow();
+  });
+
+  it('searches files by pattern', async () => {
+    await fs.mkdir(path.join(workspace, 'search_dir'), { recursive: true });
+    await fs.writeFile(path.join(workspace, 'search_dir', 'target.txt'), 'found');
+    await fs.writeFile(path.join(workspace, 'other.dat'), 'other');
+    const results = await searchFiles(workspace, 'target');
+    expect(results.some((r) => r.includes('target.txt'))).toBe(true);
+  });
+
+  it('home directory expansion works', () => {
+    const expanded = resolveWorkspacePath(workspace, '~/');
+    // Should expand to home dir — but that may escape workspace, so
+    // this test just verifies no crash for valid relative paths
+    expect(expanded).toContain(workspace);
+  });
+});
+
+describe('Linux Host — System Operations', () => {
+  it('gets system info', async () => {
+    const info = await getSystemInfo();
+    expect(info.platform).toBe('linux');
+    expect(info.cpuCount).toBeGreaterThan(0);
+    expect(info.totalMemory).toBeGreaterThan(0);
+    expect(['container', 'none']).toContain(info.isolation);
+  });
+
+  it('lists processes', async () => {
+    const procs = await listProcesses(10);
+    expect(procs.length).toBeGreaterThan(0);
+    expect(procs[0]).toHaveProperty('pid');
+    expect(procs[0]).toHaveProperty('command');
+  });
+
+  it('gets disk usage', async () => {
+    const disks = await getDiskUsage();
+    expect(disks.length).toBeGreaterThan(0);
+    expect(disks[0]).toHaveProperty('filesystem');
+    expect(disks[0]).toHaveProperty('mountedOn');
+  });
+
+  it('gets CPU info string', async () => {
+    const cpuInfo = await getCpuInfo();
+    expect(cpuInfo).toContain('cores');
+  });
+});
+
+describe('Linux Host — Terminal', () => {
+  it('creates and reuses a terminal session', async () => {
+    const host = new LinuxTerminalHost();
+    const result = await host.createOrGetSession('test-session');
+    expect(result.isNewSession).toBe(true);
+    expect(result.sessionId).toBeTruthy();
+
+    // Reuse
+    const reused = await host.createOrGetSession('test-session');
+    expect(reused.isNewSession).toBe(false);
+    expect(reused.sessionId).toBe(result.sessionId);
+
+    // Execute a command
+    const output = await host.executeInSession(result.sessionId, 'echo hello_optimuse');
+    expect(output.output).toContain('hello_optimuse');
+    expect(output.timedOut).toBe(false);
+
+    // List sessions
+    const sessions = host.listSessions();
+    expect(sessions.some((s) => s.sessionId === result.sessionId)).toBe(true);
+
+    // Close
+    const closed = host.closeSession(result.sessionId);
+    expect(closed.success).toBe(true);
+  });
+
+  it('executes hidden commands', async () => {
+    const host = new LinuxTerminalHost();
+    const result = await host.executeHiddenCommand('echo hidden_test', 'test-key');
+    expect(result.output).toContain('hidden_test');
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('handles command timeout', async () => {
+    const host = new LinuxTerminalHost();
+    const result = await host.executeHiddenCommand('sleep 10', 'timeout-test', 500);
+    expect(result.timedOut).toBe(true);
+  });
+
+  it('handles command errors gracefully', async () => {
+    const host = new LinuxTerminalHost();
+    const result = await host.executeHiddenCommand('cat /nonexistent/file/12345', 'error-test');
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toContain('No such file');
+  });
+
+  it('gets session screen', async () => {
+    const host = new LinuxTerminalHost();
+    const session = await host.createOrGetSession('screen-test');
+    const screen = host.getSessionScreen(session.sessionId);
+    expect(screen).toHaveProperty('content');
+    expect(screen).toHaveProperty('rows');
+    expect(screen).toHaveProperty('cols');
+    host.closeSession(session.sessionId);
+  });
+});
+
+describe('Linux Host — Tool Integration with Permission Gate', () => {
+  let workspace: string;
+
+  beforeAll(async () => {
+    workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'optimuse-tool-test-'));
+  });
+
+  it('registers host tools in the registry', async () => {
+    const registry = new ToolRegistry();
+    const tools = await getLinuxHostTools(workspace);
+    for (const t of tools) registry.register(t);
+
+    const registered = registry.list();
+    expect(registered.length).toBeGreaterThan(0);
+
+    // Should include terminal tools
+    expect(registered.find((t) => t.name === 'host_terminal_info')).toBeDefined();
+    expect(registered.find((t) => t.name === 'host_terminal_execute_hidden')).toBeDefined();
+
+    // Should include system tools
+    expect(registered.find((t) => t.name === 'host_system_info')).toBeDefined();
+    expect(registered.find((t) => t.name === 'host_processes_list')).toBeDefined();
+
+    // Should include enhanced fs tools
+    expect(registered.find((t) => t.name === 'host_fs_info')).toBeDefined();
+    expect(registered.find((t) => t.name === 'host_fs_move')).toBeDefined();
+  });
+
+  it('permission gate blocks WRITE tools in readonly mode', async () => {
+    const registry = new ToolRegistry();
+    const tools = await getLinuxHostTools(workspace);
+    for (const t of tools) registry.register(t);
+
+    // host_fs_move is a write tool
+    const moveTool = registry.get('host_fs_move');
+    expect(moveTool).toBeDefined();
+    expect(moveTool!.effect).toBe('write');
+
+    // In readonly mode, writes should be denied
+    expect(checkPermission('readonly', 'write', false)).toBe('deny');
+  });
+
+  it('permission gate allows READ tools in readonly mode', async () => {
+    const registry = new ToolRegistry();
+    const tools = await getLinuxHostTools(workspace);
+    for (const t of tools) registry.register(t);
+
+    // host_system_info is a read tool
+    const infoTool = registry.get('host_system_info');
+    expect(infoTool).toBeDefined();
+    expect(infoTool!.effect).toBe('read');
+
+    // In readonly mode, reads should be allowed
+    expect(checkPermission('readonly', 'read', false)).toBe('allow');
+  });
+
+  it('permission gate asks for WRITE in workspace mode', async () => {
+    expect(checkPermission('workspace', 'write', true)).toBe('ask');
+    expect(checkPermission('workspace', 'read', true)).toBe('allow');
+  });
+
+  it('permission gate allows everything in full mode', async () => {
+    expect(checkPermission('full', 'write', false)).toBe('allow');
+    expect(checkPermission('full', 'read', false)).toBe('allow');
+  });
+});

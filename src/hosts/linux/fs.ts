@@ -1,0 +1,242 @@
+/**
+ * Linux filesystem host enhancements.
+ *
+ * Provides enhanced filesystem operations that go beyond the basic workspace-jailed
+ * tools in builtin/fs.ts. This host layer respects the 4-layer security model:
+ *   - Layer 0: App Runtime Sandbox (handled by process isolation / container)
+ *   - Layer 1: Host Authorization (we detect privilege level)
+ *   - Layer 2: AI Capability Limit (readonly / workspace / full modes)
+ *   - Layer 3: User Tool Approval (requestApproval callback)
+ *
+ * The permission boundary is enforced in tools/registry.ts checkPermission().
+ * This module just provides the filesystem operations at the host layer.
+ *
+ * Source: /root/notes/ANALYSIS.md §2 "4-layer security model"
+ * Source: /root/muse/hosts/linux/src/tools/fs/mod.rs (LinuxFileSystemHost)
+ */
+
+import * as fsp from 'node:fs/promises';
+import { Dirent } from 'node:fs';
+import * as path from 'node:path';
+import * as os from 'node:os';
+
+/** Resolve a path relative to workspace root, enforcing the workspace jail.
+ *  This mirrors the Operit PathMapper pattern: resolve workspace root + target
+ *  path structurally, not via string contains.
+ */
+export function resolveWorkspacePath(workspaceRoot: string, input: string): string {
+  const raw = typeof input === 'string' ? input : '';
+
+  // Allow home directory expansion
+  const expanded = raw.startsWith('~') ? path.join(os.homedir(), raw.slice(1)) : raw;
+
+  // Absolute or relative
+  const abs = path.isAbsolute(expanded) ? expanded : path.join(workspaceRoot, expanded);
+  const resolved = path.resolve(abs);
+  const normRoot = path.resolve(workspaceRoot);
+
+  if (resolved !== normRoot && !resolved.startsWith(normRoot + path.sep)) {
+    throw new Error(`path escapes workspace: ${raw}`);
+  }
+  return resolved;
+}
+
+/** Check if a path is inside the workspace. */
+export function isInsideWorkspace(workspaceRoot: string, input: string): boolean {
+  try {
+    resolveWorkspacePath(workspaceRoot, input);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Get detailed file information. */
+export async function getFileInfo(p: string): Promise<FileInfo> {
+  const stats = await fsp.stat(p);
+  return {
+    path: p,
+    size: Number(stats.size),
+    isDirectory: stats.isDirectory(),
+    isFile: stats.isFile(),
+    isSymlink: stats.isSymbolicLink(),
+    mtime: stats.mtime,
+    atime: stats.atime,
+    ctime: stats.ctime,
+    mode: stats.mode,
+    uid: stats.uid,
+    gid: stats.gid,
+  };
+}
+
+/** Search for files recursively by name pattern. */
+export async function searchFiles(
+  root: string,
+  pattern: string,
+  maxDepth: number = 8,
+  maxResults: number = 200,
+): Promise<string[]> {
+  const matches: string[] = [];
+  const pat = pattern.toLowerCase();
+
+  async function walk(dir: string, depth: number): Promise<void> {
+    if (depth > maxDepth || matches.length > maxResults) return;
+    let entries: Dirent[];
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.name.toLowerCase().includes(pat)) {
+        matches.push(full);
+      }
+      if (entry.isDirectory() && !entry.name.startsWith('.')) {
+        await walk(full, depth + 1);
+      }
+    }
+  }
+
+  await walk(root, 0);
+  return matches;
+}
+
+/** Read a file with binary-safe output (base64 for binary, text for text). */
+export async function readFileSafe(p: string, maxLength: number = 40_000): Promise<FileReadResult> {
+  const buffer = await fsp.readFile(p);
+  const isText = isTextBuffer(buffer);
+  if (isText) {
+    const text = buffer.toString('utf8');
+    return {
+      encoding: 'utf8',
+      content: text.length > maxLength ? text.slice(0, maxLength) + '\n... (truncated)' : text,
+    };
+  }
+  return {
+    encoding: 'base64',
+    content: buffer.toString('base64'),
+    truncated: buffer.length > maxLength,
+  };
+}
+
+/** Write a file (text or base64 binary). */
+export async function writeFileSafe(
+  p: string,
+  content: string,
+  encoding: 'utf8' | 'base64' = 'utf8',
+): Promise<void> {
+  await fsp.mkdir(path.dirname(p), { recursive: true });
+  const data = encoding === 'base64' ? Buffer.from(content, 'base64') : content;
+  await fsp.writeFile(p, data);
+}
+
+/** Append to a file. */
+export async function appendFileSafe(p: string, content: string): Promise<void> {
+  await fsp.mkdir(path.dirname(p), { recursive: true });
+  await fsp.appendFile(p, content);
+}
+
+/** Move (rename) a file or directory. */
+export async function moveFile(src: string, dest: string): Promise<void> {
+  await fsp.mkdir(path.dirname(dest), { recursive: true });
+  await fsp.rename(src, dest);
+}
+
+/** Copy a file or directory recursively. */
+export async function copyFile(src: string, dest: string): Promise<void> {
+  await fsp.mkdir(path.dirname(dest), { recursive: true });
+  const stats = await fsp.stat(src);
+  if (stats.isDirectory()) {
+    await copyDirRecursive(src, dest);
+  } else {
+  await fsp.copyFile(src, dest);
+  }
+}
+
+async function copyDirRecursive(src: string, dest: string): Promise<void> {
+  await fsp.mkdir(dest, { recursive: true });
+  const entries = await fsp.readdir(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const destPath = path.join(dest, entry.name);
+    if (entry.isDirectory()) {
+      await copyDirRecursive(srcPath, destPath);
+    } else {
+    await fsp.copyFile(srcPath, destPath);
+    }
+  }
+}
+
+/** Delete a file or directory. */
+export async function deleteFile(p: string): Promise<void> {
+  const stats = await fsp.stat(p);
+  if (stats.isDirectory()) {
+    await fsp.rm(p, { recursive: true, force: true });
+  } else {
+    await fsp.unlink(p);
+  }
+}
+
+/** Zip a directory (creates a .zip archive). */
+export async function zipDirectory(srcDir: string, destZip: string): Promise<void> {
+  // Use system zip if available, otherwise throw
+  const { execSync } = await import('node:child_process');
+  try {
+    execSync(`zip -r "${destZip}" .`, {
+      cwd: srcDir,
+      stdio: 'pipe',
+    });
+  } catch (e) {
+    throw new Error(`zip command failed: ${(e as Error).message}`);
+  }
+}
+
+/** Unzip a .zip file. */
+export async function unzipFile(srcZip: string, destDir: string): Promise<void> {
+  const { execSync } = await import('node:child_process');
+  try {
+    await fsp.mkdir(destDir, { recursive: true });
+    execSync(`unzip -o "${srcZip}" -d "${destDir}"`, {
+      stdio: 'pipe',
+    });
+  } catch (e) {
+    throw new Error(`unzip command failed: ${(e as Error).message}`);
+  }
+}
+
+// --- Types ---
+
+export interface FileInfo {
+  path: string;
+  size: number;
+  isDirectory: boolean;
+  isFile: boolean;
+  isSymlink: boolean;
+  mtime: Date;
+  atime: Date;
+  ctime: Date;
+  mode: number;
+  uid: number;
+  gid: number;
+}
+
+export interface FileReadResult {
+  encoding: 'utf8' | 'base64';
+  content: string;
+  truncated?: boolean;
+}
+
+/** Heuristic: detect if a buffer is likely text. */
+function isTextBuffer(buffer: Buffer): boolean {
+  // Check for null bytes (strong binary indicator)
+  if (buffer.includes(0)) return false;
+  // Check ratio of printable chars
+  let printable = 0;
+  const sample = buffer.length > 1024 ? buffer.subarray(0, 1024) : buffer;
+  for (const b of sample) {
+    if (b >= 0x20 && b <= 0x7e) printable++;
+    if (b === 0x09 || b === 0x0a || b === 0x0d) printable++;
+  }
+  return printable / sample.length > 0.8;
+}

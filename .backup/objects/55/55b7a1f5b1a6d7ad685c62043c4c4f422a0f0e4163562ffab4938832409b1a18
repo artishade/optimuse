@@ -1,0 +1,163 @@
+/**
+ * Optimuse CLI — minimal chat surface with tools.
+ * Config via env: OPTIMUSE_BASE_URL, OPTIMUSE_API_KEY, OPTIMUSE_MODEL,
+ *                 OPTIMUSE_WORKSPACE (default cwd), OPTIMUSE_MODE (readonly|workspace|full)
+ */
+
+import * as readline from 'node:readline';
+import { Agent } from '../../core/agent.js';
+import { OpenAICompatibleProvider } from '../../providers/openai/provider.js';
+import { ToolRegistry } from '../../tools/registry.js';
+import { fsTools, shellTools } from '../../tools/builtin/index.js';
+import type { ChatMessage } from '../../types/index.js';
+import { ConnectorRegistry } from '../../connectors/registry.js';
+import { githubConnector } from '../../connectors/github/index.js';
+import { encodeCredential } from '../../connectors/types.js';
+import { getLinuxHostTools, createLinuxHost } from '../../hosts/linux/index.js';
+
+const baseUrl = process.env['OPTIMUSE_BASE_URL'] ?? 'https://api.openai.com/v1';
+const apiKey = process.env['OPTIMUSE_API_KEY'] ?? '';
+const model = process.env['OPTIMUSE_MODEL'] ?? 'gpt-4o-mini';
+const workspaceRoot = process.env['OPTIMUSE_WORKSPACE'] ?? process.cwd();
+const mode = (process.env['OPTIMUSE_MODE'] ?? 'workspace') as 'readonly' | 'workspace' | 'full';
+
+if (!apiKey) {
+  console.error('OPTIMUSE_API_KEY is required');
+  process.exit(1);
+}
+
+const registry = new ToolRegistry();
+for (const t of [...fsTools(workspaceRoot), ...shellTools(workspaceRoot)]) registry.register(t);
+
+// Phase 3: Linux host — real shell/file power with 4-layer permission gate
+const linuxHost = await createLinuxHost(workspaceRoot);
+for (const t of linuxHost.getTools()) registry.register(t);
+
+// Initialize connector registry and load available tools
+const connRegistry = await ConnectorRegistry.create();
+connRegistry.register(githubConnector);
+
+// Register tools from connected connectors
+const connTools = await connRegistry.getTools();
+for (const t of connTools) registry.register(t);
+
+const provider = new OpenAICompatibleProvider({ baseUrl, apiKey, model });
+const agent = new Agent(provider, registry, {
+  permissionMode: mode,
+  workspaceRoot,
+  maxSteps: 16,
+  onToolCall: (c) => console.log(`  ⚙ ${c.name} ${JSON.stringify(c.arguments).slice(0, 120)}`),
+  onToolResult: (c, r) => console.log(`  ${r.ok ? '✔' : '✘'} ${c.name}`),
+});
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'you › ' });
+const history: ChatMessage[] = [];
+
+console.log(`Optimuse v0.1 · model=${model} · mode=${mode} · workspace=${workspaceRoot}`);
+console.log(`Vault backend: ${connRegistry.vaultBackend()}`);
+console.log('type your message, /tools to list tools, /connectors to manage connectors, /exit to quit\n');
+
+// Show available connectors
+console.log('Available connectors:');
+for (const c of connRegistry.list()) {
+  const hasCred = await connRegistry.hasCredential(c.id);
+  console.log(`  /connectors ${c.id} ${hasCred ? 'disconnect' : 'connect'} — ${c.description}`);
+}
+
+async function refreshConnectorTools(): Promise<void> {
+  const connTools = await connRegistry.getTools();
+  // Remove existing connector-prefixed tools
+  for (const t of registry.list()) {
+    if (t.name.includes('_')) registry.unregister(t.name);
+  }
+  for (const t of connTools) registry.register(t);
+}
+
+async function handleConnectorAction(connectorId: string, action: 'connect' | 'disconnect' | 'validate'): Promise<void> {
+  const connector = connRegistry.get(connectorId);
+  if (!connector) {
+    console.log(`  Unknown connector: ${connectorId}`);
+    return;
+  }
+  if (action === 'validate') {
+    const result = await connRegistry.validate(connectorId);
+    if (result.ok) console.log(`  ✅ Connected as: ${result.account}`);
+    else console.log(`  ❌ Validation failed: ${result.error}`);
+    return;
+  }
+  if (action === 'disconnect') {
+    await connRegistry.deleteCredential(connectorId);
+    for (const t of registry.list()) {
+      if (t.name.startsWith(`${connectorId}_`)) registry.unregister(t.name);
+    }
+    console.log(`  🔌 Disconnected ${connectorId}`);
+    return;
+  }
+  // connect
+  if (connectorId === 'github') {
+    const token = await new Promise<string>((resolve) =>
+      rl.question('  GitHub token: ', (ans) => resolve(ans.trim()))
+    );
+    const method = connector.authMethods[0];
+    if (!method) { console.log('  No auth method available'); return; }
+    const cred = encodeCredential(method, { token });
+    await connRegistry.setCredential(connectorId, cred);
+    const result = await connRegistry.validate(connectorId);
+    if (result.ok) {
+      console.log(`  ✅ Connected to GitHub as: ${result.account}`);
+      await refreshConnectorTools();
+    } else {
+      console.log(`  ❌ Connection failed: ${result.error}`);
+    }
+  } else {
+    console.log(`  Connect flow not implemented for ${connectorId}`);
+  }
+}
+
+async function listConnectors(): Promise<void> {
+  for (const c of connRegistry.list()) {
+    const hasCred = await connRegistry.hasCredential(c.id);
+    if (hasCred) {
+      const result = await connRegistry.validate(c.id);
+      console.log(`  ${result.ok ? '🔗' : '⚠️'} ${c.id} — ${result.ok ? result.account : 'credentials invalid'}`);
+    } else {
+      console.log(`  ⚪ ${c.id} — disconnected`);
+    }
+  }
+}
+
+rl.on('line', (line) => {
+  const input = line.trim();
+  if (!input) { rl.prompt(); return; }
+  if (input === '/exit') { rl.close(); return; }
+  if (input === '/tools') {
+    for (const t of registry.list()) console.log(`  ${t.effect === 'write' ? '✎' : '👁'} ${t.name} — ${t.description}`);
+    rl.prompt();
+    return;
+  }
+  if (input === '/connectors') {
+    rl.pause();
+    listConnectors().finally(() => { rl.resume(); rl.prompt(); });
+    return;
+  }
+  const match = input.match(/^\/connectors\s+(\w+)\s+(connect|disconnect|validate)$/);
+  if (match) {
+    const connectorId = match[1]!;
+    const action = match[2]! as 'connect' | 'disconnect' | 'validate';
+    handleConnectorAction(connectorId, action)
+      .finally(() => { rl.prompt(); });
+    return;
+  }
+  rl.pause();
+  agent
+    .run(input, history)
+    .then((r) => {
+      console.log(`\noptimuse › ${r.finalText}\n`);
+      history.push({ role: 'user', content: input });
+      history.push({ role: 'assistant', content: r.finalText });
+    })
+    .catch((e) => console.error('error:', (e as Error).message))
+    .finally(() => { rl.resume(); rl.prompt(); });
+});
+
+rl.prompt();

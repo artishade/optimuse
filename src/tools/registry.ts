@@ -28,6 +28,11 @@ export class ToolRegistry {
     return this.tools.get(name);
   }
 
+  /** Remove a tool from the registry (used when disconnecting connectors). */
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
+  }
+
   list(): ToolDefinition[] {
     return [...this.tools.values()];
   }

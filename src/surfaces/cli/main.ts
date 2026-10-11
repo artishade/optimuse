@@ -8,8 +8,12 @@ import * as readline from 'node:readline';
 import { Agent } from '../../core/agent.js';
 import { OpenAICompatibleProvider } from '../../providers/openai/provider.js';
 import { ToolRegistry } from '../../tools/registry.js';
-import { fsTools, shellTools } from '../../tools/builtin/index.js';
+import { fsTools, shellTools, fileManagerTools } from '../../tools/builtin/index.js';
 import type { ChatMessage } from '../../types/index.js';
+import { ConnectorRegistry } from '../../connectors/registry.js';
+import { githubConnector } from '../../connectors/github/index.js';
+import { encodeCredential } from '../../connectors/types.js';
+import { getLinuxHostTools, createLinuxHost } from '../../hosts/linux/index.js';
 
 const baseUrl = process.env['OPTIMUSE_BASE_URL'] ?? 'https://api.openai.com/v1';
 const apiKey = process.env['OPTIMUSE_API_KEY'] ?? '';
@@ -25,6 +29,40 @@ if (!apiKey) {
 const registry = new ToolRegistry();
 for (const t of [...fsTools(workspaceRoot), ...shellTools(workspaceRoot)]) registry.register(t);
 
+// Phase 3: Linux host — real shell/file power with 4-layer permission gate
+const linuxHost = await createLinuxHost(workspaceRoot);
+for (const t of linuxHost.getTools()) registry.register(t);
+
+
+// File Manager tools (workspace file operations with rich metadata)
+for (const t of fileManagerTools(workspaceRoot)) registry.register(t);
+
+// Optional: connect to a remote agent_linux service for real root shell + mesh
+const agentLinuxUrl = process.env['AGENT_LINUX_URL'] ?? process.env['OPTIMUSE_AGENT_LINUX_URL'] ?? '';
+const agentLinuxToken = process.env['AGENT_LINUX_TOKEN'] ?? process.env['OPTIMUSE_AGENT_LINUX_TOKEN'] ?? '';
+
+if (agentLinuxUrl && agentLinuxToken) {
+  const { createAgentLinuxTools } = await import('../../agents/agent_linux_adapter.js');
+  try {
+    const { tools: agentLinuxTools } = await createAgentLinuxTools({
+      baseUrl: agentLinuxUrl,
+      token: agentLinuxToken,
+      workspace: workspaceRoot,
+    });
+    for (const t of agentLinuxTools) registry.register(t);
+    console.log(`Agent_X connected: ${agentLinuxTools.length} remote tools (shell, SSH, MCP, mesh)`);
+  } catch (e) {
+    console.warn(`Agent_X connection failed: ${(e as Error).message}`);
+  }
+}
+
+const connRegistry = await ConnectorRegistry.create();
+connRegistry.register(githubConnector);
+
+// Register tools from connected connectors
+const connTools = await connRegistry.getTools();
+for (const t of connTools) registry.register(t);
+
 const provider = new OpenAICompatibleProvider({ baseUrl, apiKey, model });
 const agent = new Agent(provider, registry, {
   permissionMode: mode,
@@ -38,8 +76,78 @@ const rl = readline.createInterface({ input: process.stdin, output: process.stdo
 const history: ChatMessage[] = [];
 
 console.log(`Optimuse v0.1 · model=${model} · mode=${mode} · workspace=${workspaceRoot}`);
-console.log('type your message, /tools to list tools, /exit to quit\n');
-rl.prompt();
+console.log(`Host: ${linuxHost.descriptor.displayName} · isolation=${linuxHost.descriptor.isolation}`);
+console.log(`Vault backend: ${connRegistry.vaultBackend()}`);
+console.log('type your message, /tools to list tools, /connectors to manage connectors, /exit to quit\n');
+
+// Show available connectors
+console.log('Available connectors:');
+for (const c of connRegistry.list()) {
+  const hasCred = await connRegistry.hasCredential(c.id);
+  console.log(`  /connectors ${c.id} ${hasCred ? 'disconnect' : 'connect'} — ${c.description}`);
+}
+
+async function refreshConnectorTools(): Promise<void> {
+  const connTools = await connRegistry.getTools();
+  // Remove existing connector-prefixed tools
+  for (const t of registry.list()) {
+    if (t.name.includes('_')) registry.unregister(t.name);
+  }
+  for (const t of connTools) registry.register(t);
+}
+
+async function handleConnectorAction(connectorId: string, action: 'connect' | 'disconnect' | 'validate'): Promise<void> {
+  const connector = connRegistry.get(connectorId);
+  if (!connector) {
+    console.log(`  Unknown connector: ${connectorId}`);
+    return;
+  }
+  if (action === 'validate') {
+    const result = await connRegistry.validate(connectorId);
+    if (result.ok) console.log(`  ✅ Connected as: ${result.account}`);
+    else console.log(`  ❌ Validation failed: ${result.error}`);
+    return;
+  }
+  if (action === 'disconnect') {
+    await connRegistry.deleteCredential(connectorId);
+    for (const t of registry.list()) {
+      if (t.name.startsWith(`${connectorId}_`)) registry.unregister(t.name);
+    }
+    console.log(`  🔌 Disconnected ${connectorId}`);
+    return;
+  }
+  // connect
+  if (connectorId === 'github') {
+    const token = await new Promise<string>((resolve) =>
+      rl.question('  GitHub token: ', (ans) => resolve(ans.trim()))
+    );
+    const method = connector.authMethods[0];
+    if (!method) { console.log('  No auth method available'); return; }
+    const cred = encodeCredential(method, { token });
+    await connRegistry.setCredential(connectorId, cred);
+    const result = await connRegistry.validate(connectorId);
+    if (result.ok) {
+      console.log(`  ✅ Connected to GitHub as: ${result.account}`);
+      await refreshConnectorTools();
+    } else {
+      console.log(`  ❌ Connection failed: ${result.error}`);
+    }
+  } else {
+    console.log(`  Connect flow not implemented for ${connectorId}`);
+  }
+}
+
+async function listConnectors(): Promise<void> {
+  for (const c of connRegistry.list()) {
+    const hasCred = await connRegistry.hasCredential(c.id);
+    if (hasCred) {
+      const result = await connRegistry.validate(c.id);
+      console.log(`  ${result.ok ? '🔗' : '⚠️'} ${c.id} — ${result.ok ? result.account : 'credentials invalid'}`);
+    } else {
+      console.log(`  ⚪ ${c.id} — disconnected`);
+    }
+  }
+}
 
 rl.on('line', (line) => {
   const input = line.trim();
@@ -48,6 +156,19 @@ rl.on('line', (line) => {
   if (input === '/tools') {
     for (const t of registry.list()) console.log(`  ${t.effect === 'write' ? '✎' : '👁'} ${t.name} — ${t.description}`);
     rl.prompt();
+    return;
+  }
+  if (input === '/connectors') {
+    rl.pause();
+    listConnectors().finally(() => { rl.resume(); rl.prompt(); });
+    return;
+  }
+  const match = input.match(/^\/connectors\s+(\w+)\s+(connect|disconnect|validate)$/);
+  if (match) {
+    const connectorId = match[1]!;
+    const action = match[2]! as 'connect' | 'disconnect' | 'validate';
+    handleConnectorAction(connectorId, action)
+      .finally(() => { rl.prompt(); });
     return;
   }
   rl.pause();
@@ -62,4 +183,4 @@ rl.on('line', (line) => {
     .finally(() => { rl.resume(); rl.prompt(); });
 });
 
-rl.on('close', () => { console.log('bye 👋'); process.exit(0); });
+rl.prompt();

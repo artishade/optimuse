@@ -9,7 +9,9 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/surfaces/cli/main.ts",
+    "dev:web": "tsx watch src/surfaces/web/server.ts",
     "start": "node dist/surfaces/cli/main.js",
+    "start:web": "node dist/surfaces/web/server.js",
     "test": "vitest run"
   },
   "keywords": [

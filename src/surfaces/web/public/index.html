@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Optimuse</title>
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="icon" href="data:, " />
+</head>
+<body>
+  <div class="app">
+    <!-- Left: Interaction Panel (Koro/Chat) -->
+    <div class="panel interaction-panel">
+      <div class="panel-header">
+        <span class="panel-title">Optimuse</span>
+        <span class="panel-meta">
+          <button id="settings-btn" class="settings-btn">⚙ Settings</button>
+        </span>
+      </div>
+      <div class="chat-container" id="chat-container">
+        <div class="chat-welcome">
+          <div class="welcome-message">👋 Welcome to Optimuse</div>
+          <div class="welcome-hint">Type a message below to start chatting with your AI assistant.</div>
+        </div>
+      </div>
+      <div class="input-area">
+        <div class="input-row">
+          <textarea id="message-input" placeholder="Ask me anything..." rows="1" autoResize></textarea>
+          <button id="send-btn" class="send-btn" disabled>➤</button>
+        </div>
+        <div class="connector-bar" id="connector-bar"></div>
+      </div>
+    </div>
+
+    <!-- Right: Preview Panel -->
+    <div class="panel preview-panel">
+      <div class="panel-header">
+        <span class="panel-title">Preview</span>
+      </div>
+      <div class="preview-container" id="preview-container">
+        <div class="preview-placeholder">📺 Preview will appear here</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay" id="settings-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <span class="panel-title">Settings</span>
+        <button id="close-settings" class="modal-close">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="setting-group">
+          <label for="api-key">API Key</label>
+          <input type="password" id="api-key" placeholder="sk-..." />
+          <span class="setting-hint">OpenAI-compatible API key. Stored locally in encrypted vault.</span>
+        </div>
+        <div class="setting-group">
+          <label for="base-url">Base URL</label>
+          <input type="url" id="base-url" placeholder="https://api.openai.com/v1" />
+          <span class="setting-hint">API endpoint base URL (must end with /v1).</span>
+        </div>
+        <div class="setting-group">
+          <label for="model-name">Model</label>
+          <input type="text" id="model-name" placeholder="gpt-4o-mini" />
+          <span class="setting-hint">Model name to use for requests.</span>
+        </div>
+        <div class="setting-group">
+          <label for="workspace-path">Workspace</label>
+          <input type="text" id="workspace-path" placeholder="/root/optimuse" />
+          <span class="setting-hint">Workspace root directory for file/shell tools.</span>
+        </div>
+        <div class="setting-group">
+          <label for="permission-mode">Permission Mode</label>
+          <select id="permission-mode">
+            <option value="readonly">Readonly (blocks writes)</option>
+            <option value="workspace" selected>Workspace (asks for writes)</option>
+            <option value="full">Full (allows all)</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="save-settings" class="send-btn">Save & Reload</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

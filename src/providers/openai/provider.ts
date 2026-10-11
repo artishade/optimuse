@@ -32,7 +32,12 @@ export interface Provider {
 }
 
 export class OpenAICompatibleProvider implements Provider {
-  constructor(private cfg: ProviderConfig) {}
+  constructor(protected cfg: ProviderConfig) {}
+
+  /** Update the provider's configuration at runtime (used when settings change via UI). */
+  updateConfig(newCfg: Partial<ProviderConfig>): void {
+    this.cfg = { ...this.cfg, ...newCfg };
+  }
 
   async chat(
     messages: ChatMessage[],

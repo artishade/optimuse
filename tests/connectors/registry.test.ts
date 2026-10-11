@@ -1,0 +1,126 @@
+import { describe, expect, it } from 'vitest';
+import { ConnectorRegistry } from '../../src/connectors/registry.js';
+import { githubConnector } from '../../src/connectors/github/index.js';
+import type { ConnectorDefinition } from '../../src/connectors/types.js';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+const echoConnector: ConnectorDefinition = {
+  id: 'echo',
+  name: 'Echo',
+  description: 'Test echo connector',
+  icon: 'echo',
+  category: 'dev',
+  authMethods: [
+    {
+      id: 'token',
+      label: 'Token',
+      kind: 'credentials',
+      fields: [{ id: 'token', label: 'Token', secret: true, required: true }],
+    },
+  ],
+  async validate(cred) {
+    if (cred.secret === 'valid') return { account: 'echo-user' };
+    throw new Error('invalid token');
+  },
+  createTools({ getCredential }) {
+    return [
+      {
+        name: 'echo_ping',
+        description: 'Ping the echo service',
+        effect: 'read',
+        parameters: [],
+        async execute() {
+          const cred = await getCredential();
+          return { ok: true, content: `pong: ${cred.secret}` };
+        },
+      },
+    ];
+  },
+};
+
+describe('ConnectorRegistry', () => {
+  let vaultDir: string;
+
+  async function makeRegistry(): Promise<ConnectorRegistry> {
+    vaultDir = await fs.mkdtemp(path.join(os.tmpdir(), 'optimuse-vault-'));
+    return ConnectorRegistry.create(vaultDir);
+  }
+
+  it('registers and lists connectors', async () => {
+    const r = await makeRegistry();
+    r.register(echoConnector);
+    expect(r.list()).toHaveLength(1);
+    expect(r.get('echo')?.id).toBe('echo');
+  });
+
+  it('stores and retrieves credentials', async () => {
+    const r = await makeRegistry();
+    r.register(echoConnector);
+    await r.setCredential('echo', { kind: 'api_key', secret: 'valid' });
+    expect(await r.hasCredential('echo')).toBe(true);
+    const cred = await r.getCredential('echo');
+    expect(cred?.secret).toBe('valid');
+  });
+
+  it('validates credentials', async () => {
+    const r = await makeRegistry();
+    r.register(echoConnector);
+    await r.setCredential('echo', { kind: 'api_key', secret: 'valid' });
+    const result = await r.validate('echo');
+    expect(result.ok).toBe(true);
+    expect(result.account).toBe('echo-user');
+  });
+
+  it('reports validation failure for bad credentials', async () => {
+    const r = await makeRegistry();
+    r.register(echoConnector);
+    await r.setCredential('echo', { kind: 'api_key', secret: 'bogus' });
+    const result = await r.validate('echo');
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('invalid token');
+  });
+
+  it('deletes credentials', async () => {
+    const r = await makeRegistry();
+    r.register(echoConnector);
+    await r.setCredential('echo', { kind: 'api_key', secret: 'valid' });
+    await r.deleteCredential('echo');
+    expect(await r.hasCredential('echo')).toBe(false);
+  });
+
+  it('provisions tools only for connected connectors', async () => {
+    const r = await makeRegistry();
+    r.register(echoConnector);
+    // No credentials → no tools
+    expect((await r.getTools()).length).toBe(0);
+    // With credentials → tools available
+    await r.setCredential('echo', { kind: 'api_key', secret: 'valid' });
+    const tools = await r.getTools();
+    expect(tools).toHaveLength(1);
+    expect(tools[0]?.name).toBe('echo_ping');
+  });
+
+  it('github connector registers and provisions tools', async () => {
+    const r = await makeRegistry();
+    r.register(githubConnector);
+    await r.setCredential('github', { kind: 'pat', secret: 'test-token' });
+    const tools = await r.getTools();
+    const names = tools.map((t) => t.name);
+    expect(names).toContain('github_me');
+    expect(names).toContain('github_search_repos');
+    expect(names).toContain('github_create_issue');
+  });
+
+  it('uses encrypted file vault as fallback', async () => {
+    const r = await makeRegistry();
+    expect(r.vaultBackend()).toBe('encrypted-file');
+    await r.setCredential('echo', { kind: 'api_key', secret: 'secret123' });
+    const files = await fs.readdir(vaultDir);
+    expect(files).toContain('vault.enc');
+    const r2 = await ConnectorRegistry.create(vaultDir);
+    const cred = await r2.getCredential('echo');
+    expect(cred?.secret).toBe('secret123');
+  });
+});

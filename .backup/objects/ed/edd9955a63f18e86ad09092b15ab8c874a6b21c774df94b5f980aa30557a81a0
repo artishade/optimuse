@@ -1,0 +1,301 @@
+/**
+ * Linux system operation host.
+ *
+ * Ports the Operit2 LinuxSystemOperationHost concept into TypeScript.
+ * Provides system-level tools: process listing, system info, notifications,
+ * and environment queries — all gated by the 4-layer security model.
+ *
+ * READ operations (info, list, query) — always allowed in readonly/workpace modes.
+ * WRITE operations (set, modify, start, stop) — require workspace mode + approval.
+ *
+ * Source: /root/notes/ANALYSIS.md §2 "4-layer security model"
+ * Source: /root/muse/hosts/linux/src/tools/system/ (LinuxSystemOperationHost)
+ */
+
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import * as os from 'node:os';
+import * as fs from 'node:fs/promises';
+
+const execAsync = promisify(exec);
+
+const DEFAULT_TIMEOUT = 30_000;
+const MAX_OUTPUT = 50_000;
+
+/** System information snapshot. */
+export interface SystemInfo {
+  hostname: string;
+  platform: string;
+  arch: string;
+  release: string;
+  uptime: number;
+  cpuCount: number;
+  cpuModel: string;
+  totalMemory: number;
+  freeMemory: number;
+  user: string;
+  uid: number;
+  homeDir: string;
+  shell: string;
+  container?: string;
+  isolation: string;
+}
+
+/** Running process entry. */
+export interface ProcessInfo {
+  pid: number;
+  ppid: number;
+  user: string;
+  cpu: string;
+  mem: string;
+  vsz: string;
+  rss: string;
+  tty: string;
+  stat: string;
+  start: string;
+  time: string;
+  command: string;
+}
+
+/** Disk usage entry. */
+export interface DiskUsage {
+  filesystem: string;
+  size: string;
+  used: string;
+  available: string;
+  usagePercent: number;
+  mountedOn: string;
+}
+
+/** Package manager info. */
+export interface PackageManager {
+  name: 'apt' | 'dnf' | 'pacman' | 'brew' | 'nix' | 'unknown';
+  available: boolean;
+}
+
+/**
+ * Gather comprehensive system information.
+ * This is a READ operation — always allowed.
+ */
+export async function getSystemInfo(): Promise<SystemInfo> {
+  const cpus = os.cpus();
+  const load = os.loadavg();
+  const container = detectContainer();
+
+  // Get shell
+  let shell = '/bin/bash';
+  try {
+    shell = await fs.readFile('/etc/shells', 'utf8').then((content) => {
+      const lines = content.split('\n').filter((l) => l.trim());
+      return lines[0] || '/bin/bash';
+    });
+  } catch {
+    // use default
+  }
+
+  return {
+    hostname: os.hostname(),
+    platform: os.platform(),
+    arch: os.arch(),
+    release: os.release(),
+    uptime: os.uptime(),
+    cpuCount: cpus.length,
+    cpuModel: cpus[0]?.model || 'unknown',
+    totalMemory: os.totalmem(),
+    freeMemory: os.freemem(),
+    user: os.userInfo().username,
+    uid: os.userInfo().uid,
+    homeDir: os.userInfo().homedir || os.homedir(),
+    shell,
+    container,
+    isolation: container ? 'container' : 'none',
+  };
+}
+
+/**
+ * List running processes.
+ * This is a READ operation — always allowed in readonly/workspace modes.
+ */
+export async function listProcesses(
+  limit: number = 100,
+): Promise<ProcessInfo[]> {
+  try {
+    const { stdout } = await execAsync('ps aux --sort=-rss', {
+      timeout: DEFAULT_TIMEOUT,
+      maxBuffer: MAX_OUTPUT,
+    });
+
+    const lines = stdout.trim().split('\n');
+    // Skip header
+    const processes: ProcessInfo[] = [];
+    for (let i = 1; i < Math.min(lines.length, limit + 1); i++) {
+      const line = lines[i] || '';
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 11) continue;
+
+      processes.push({
+        user: parts[0] ?? '',
+        pid: parseInt(parts[1] ?? '0', 10),
+        ppid: parseInt(parts[2] ?? '0', 10),
+        cpu: parts[3] ?? '',
+        mem: parts[4] ?? '',
+        vsz: parts[5] ?? '',
+        rss: parts[6] ?? '',
+        tty: parts[7] ?? '',
+        stat: parts[8] ?? '',
+        start: parts[9] ?? '',
+        time: parts[10] ?? '',
+        command: parts.slice(11).join(' '),
+      });
+    }
+    return processes;
+  } catch (e) {
+    throw new Error(`Failed to list processes: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Find processes by name pattern.
+ * This is a READ operation.
+ */
+export async function findProcesses(pattern: string): Promise<ProcessInfo[]> {
+  const all = await listProcesses(500);
+  const pat = pattern.toLowerCase();
+  return all.filter((p) => p.command.toLowerCase().includes(pat));
+}
+
+/**
+ * Kill a process by PID.
+ * This is a WRITE operation — requires workspace or full mode + approval.
+ */
+export async function killProcess(pid: number, signal: string = 'SIGTERM'): Promise<boolean> {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch (e: any) {
+    if (e.code === 'ESRCH') return false; // already dead
+    throw new Error(`Failed to kill process ${pid}: ${e.message}`);
+  }
+}
+
+/**
+ * Get disk usage information.
+ * This is a READ operation.
+ */
+export async function getDiskUsage(): Promise<DiskUsage[]> {
+  try {
+    const { stdout } = await execAsync('df -h --output=source,size,used,avail,pcent,target', {
+      timeout: DEFAULT_TIMEOUT,
+      maxBuffer: MAX_OUTPUT,
+    });
+
+    const lines = stdout.trim().split('\n');
+    if (lines.length < 2) return [];
+
+    const result: DiskUsage[] = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i] || '';
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 6) continue;
+
+      const usageStr = parts[4] ?? '0%';
+      const usagePercent = parseInt(usageStr.replace('%', ''), 10) || 0;
+
+      result.push({
+        filesystem: parts[0] ?? '',
+        size: parts[1] ?? '',
+        used: parts[2] ?? '',
+        available: parts[3] ?? '',
+        usagePercent,
+        mountedOn: parts[5] ?? '',
+      });
+    }
+    return result;
+  } catch (e) {
+    throw new Error(`Failed to get disk usage: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Get CPU architecture and model info.
+ * This is a READ operation.
+ */
+export async function getCpuInfo(): Promise<string> {
+  try {
+    const { stdout } = await execAsync('cat /proc/cpuinfo', {
+      timeout: DEFAULT_TIMEOUT,
+      maxBuffer: MAX_OUTPUT,
+    });
+    // Return just the model name and core count
+    const modelMatch = stdout.match(/model name\s*:\s*(.+)/);
+    const model = modelMatch ? modelMatch[1].trim() : 'unknown';
+    const cores = os.cpus().length;
+    return `${model} (${cores} cores)`;
+  } catch {
+    return `${(os.cpus()[0]?.model ?? 'unknown')} (${os.cpus().length} cores)`;
+  }
+}
+
+/**
+ * Send a desktop notification.
+ * This is a WRITE operation — affects system state (notification daemon).
+ */
+export async function sendNotification(
+  title: string,
+  body: string,
+  urgency: 'low' | 'normal' | 'critical' = 'normal',
+): Promise<void> {
+  try {
+    const { execSync } = await import('node:child_process');
+    execSync(
+      `notify-send --urgency=${urgency} "${title}" "${body}"`,
+      { stdio: 'pipe', timeout: 10_000 },
+    );
+  } catch (e) {
+    throw new Error(`Failed to send notification: ${(e as Error).message}`);
+  }
+}
+
+/**
+ * Detect if running in a container.
+ */
+function detectContainer(): string | undefined {
+  try {
+    const fsSync = require('node:fs');
+    if (fsSync.existsSync('/.dockerenv')) return 'docker';
+
+    const cgroup = fsSync.readFileSync('/proc/1/cgroup', 'utf8');
+    if (cgroup.includes('docker')) return 'docker';
+    if (cgroup.includes('containerd')) return 'containerd';
+    if (cgroup.includes('kubepods')) return 'kubernetes';
+  } catch {
+    // not in a container
+  }
+  return undefined;
+}
+
+/**
+ * Detect available package manager.
+ */
+export async function getPackageManager(): Promise<PackageManager> {
+  const { execSync } = await import('node:child_process');
+  const managers: PackageManager[] = [
+    { name: 'apt', available: false },
+    { name: 'dnf', available: false },
+    { name: 'pacman', available: false },
+    { name: 'brew', available: false },
+    { name: 'nix', available: false },
+  ];
+
+  for (const pm of managers) {
+    try {
+      execSync(`which ${pm.name}`, { stdio: 'pipe' });
+      pm.available = true;
+      return pm;
+    } catch {
+      // not available
+    }
+  }
+
+  return { name: 'unknown', available: false };
+}

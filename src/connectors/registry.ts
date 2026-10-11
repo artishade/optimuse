@@ -1,0 +1,108 @@
+/**
+ * Connector registry — central manager for service connectors.
+ * Handles credential storage via vault, connector discovery, and tool provisioning.
+ */
+
+import type { ConnectorDefinition, ConnectorDeps, Credential } from './types.js';
+import { openVault, type Vault } from './auth/vault.js';
+import type { ToolDefinition } from '../types/index.js';
+
+export class ConnectorRegistry {
+  private connectors = new Map<string, ConnectorDefinition>();
+  private connectorDeps = new Map<string, ConnectorDeps>();
+
+  constructor(private vault: Vault) {}
+
+  static async create(vaultDir?: string): Promise<ConnectorRegistry> {
+    const vault = await openVault(vaultDir);
+    return new ConnectorRegistry(vault);
+  }
+
+  register(definition: ConnectorDefinition): void {
+    this.connectors.set(definition.id, definition);
+  }
+
+  get(id: string): ConnectorDefinition | undefined {
+    return this.connectors.get(id);
+  }
+
+  list(): ConnectorDefinition[] {
+    return [...this.connectors.values()];
+  }
+
+  /** Get the vault backend name for diagnostics. */
+  vaultBackend(): 'keychain' | 'encrypted-file' {
+    return this.vault.backend;
+  }
+
+  /** Set credentials for a connector. */
+  async setCredential(connectorId: string, cred: Credential): Promise<void> {
+    await this.vault.set(connectorId, cred);
+    // Cache deps for tool creation
+    this.connectorDeps.set(connectorId, {
+      getCredential: async () => cred,
+    });
+  }
+
+  /** Retrieve credentials for a connector. */
+  async getCredential(connectorId: string): Promise<Credential | null> {
+    const cached = this.connectorDeps.get(connectorId);
+    if (cached) return cached.getCredential();
+    return this.vault.get(connectorId);
+  }
+
+  /** Delete credentials for a connector (disconnect). */
+  async deleteCredential(connectorId: string): Promise<void> {
+    await this.vault.delete(connectorId);
+    this.connectorDeps.delete(connectorId);
+  }
+
+  /** Check if a connector has credentials configured. */
+  async hasCredential(connectorId: string): Promise<boolean> {
+    const cred = await this.vault.get(connectorId);
+    return cred !== null;
+  }
+
+  /** Validate credentials using the connector's validate method. */
+  async validate(connectorId: string, signal?: AbortSignal): Promise<{ ok: boolean; account?: string; error?: string }> {
+    const connector = this.connectors.get(connectorId);
+    if (!connector) {
+      return { ok: false, error: `connector not found: ${connectorId}` };
+    }
+    const cred = await this.vault.get(connectorId);
+    if (!cred) {
+      return { ok: false, error: 'no credentials configured' };
+    }
+    try {
+      const result = await connector.validate(cred, signal);
+      return { ok: true, account: result.account };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { ok: false, error: msg };
+    }
+  }
+
+  /**
+   * Get all tools from all connected connectors.
+   * Only connectors with valid credentials will produce tools.
+   */
+  async getTools(): Promise<ToolDefinition[]> {
+    const tools: ToolDefinition[] = [];
+    for (const [id, connector] of this.connectors) {
+      const cred = await this.vault.get(id);
+      if (!cred) continue;
+      const deps: ConnectorDeps = {
+        getCredential: async () => cred,
+      };
+      this.connectorDeps.set(id, deps);
+      const connectorTools = connector.createTools(deps);
+      // Namespace: prefix tools with connector id if not already prefixed
+      const namespaced = connectorTools.map(t => {
+        const baseName = t.name.startsWith(`${id}_`) ? t.name.slice(id.length + 1) : t.name;
+        return { ...t, name: `${id}_${baseName}` };
+      });
+      tools.push(...namespaced);
+    }
+    return tools;
+  }
+}

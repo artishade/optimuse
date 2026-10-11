@@ -1,0 +1,43 @@
+{
+  "name": "optimuse",
+  "version": "0.1.0",
+  "description": "Agentic assistant core: tools, connectors, mesh, multi-surface",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/surfaces/cli/main.ts",
+    "dev:web": "tsx watch src/surfaces/web/server.ts",
+    "start": "node dist/surfaces/cli/main.js",
+    "start:web": "node dist/surfaces/web/server.js",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "tools",
+    "connectors",
+    "mesh"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "zod": "^3.24.0",
+    "undici": "^7.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "vitest": "^3.0.0",
+    "@types/node": "^22.10.0",
+    "@types/better-sqlite3": "^7.6.0"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.7.0",
+    "keytar": "^7.9.3"
+  }
+}

@@ -1,0 +1,236 @@
+/**
+ * Linux host environment descriptor.
+ *
+ * Ports the Operit2 HostEnvironmentDescriptor (Rust) into TypeScript.
+ * Describes the host's platform, privilege level, isolation state,
+ * capabilities, and workspace roots — the OS-granted capability surface
+ * that the 4-layer security model layer 1 (Host Authorization) is based on.
+ *
+ * Source: /root/notes/ANALYSIS.md §2 "4-layer security model"
+ * Source: /root/muse/hosts/linux/src/lib.rs (LinuxHostRuntime...)
+ * Source: permission-access-architecture.md §4 (HostEnvironmentDescriptor)
+ */
+
+import { platform, userInfo } from 'node:os';
+import { statSync } from 'node:fs';
+
+export type HostPlatform = 'linux' | 'android' | 'web' | 'windows' | 'macos';
+
+export type HostPrivilege =
+  | 'normal'        // standard user
+  | 'root'          // full root
+  | 'service';      // system service account
+
+export type HostIsolation = 'none' | 'container' | 'virtual_machine';
+
+export interface HostCapability {
+  id: string;
+  displayName: string;
+  description: string;
+  /** Whether this capability is available in the current runtime. */
+  available: boolean;
+}
+
+export interface WorkspaceRootDescriptor {
+  id: string;
+  path: string;
+  displayName: string;
+  writable: boolean;
+}
+
+export interface HostOnboardingRequirement {
+  id: string;
+  title: string;
+  description: string;
+  /** Whether the requirement is satisfied at runtime. */
+  satisfied: boolean;
+}
+
+export interface HostEnvironmentDescriptor {
+  id: string;
+  displayName: string;
+  platform: HostPlatform;
+  privilege: HostPrivilege;
+  isolation: HostIsolation;
+  capabilities: HostCapability[];
+  workspaceRoots: WorkspaceRootDescriptor[];
+  onboardingRequirements: HostOnboardingRequirement[];
+}
+
+/**
+ * Detect the Linux host environment at runtime.
+ * Checks for root, containerization, and available system capabilities.
+ */
+export function detectLinuxHost(workspaceRoot: string): HostEnvironmentDescriptor {
+  const isRoot = userInfo().uid === 0;
+  const priv: HostPrivilege = isRoot ? 'root' : 'normal';
+
+  // Container detection ( cgroups v1/v2 )
+  let isolation: HostIsolation = 'none';
+  try {
+    const cgroup = await readCgroupInfo();
+    if (cgroup.includes('docker') || cgroup.includes('containerd')) {
+      isolation = 'container';
+    } else if (cgroup.includes('kubepods')) {
+      isolation = 'container';
+    }
+  } catch {
+    // cgroup check failed — likely not in a container
+  }
+
+  // Check if /proc/1/sched mentions container runtimes
+  if (isolation === 'none') {
+    try {
+      const initProc = await readInitProcessName();
+      const containerIndicators = ['docker', 'containerd', 'kubepods', 'lxc', 'podman'];
+      if (containerIndicators.some((c) => initProc.includes(c))) {
+        isolation = 'container';
+      }
+    } catch {
+      // not determinable
+    }
+  }
+
+  const capabilities: HostCapability[] = [
+    {
+      id: 'filesystem',
+      displayName: 'Filesystem',
+      description: 'Read and write files within the workspace root',
+      available: canAccessFilesystem(workspaceRoot),
+    },
+    {
+      id: 'terminal',
+      displayName: 'Terminal',
+      description: 'Execute shell commands via PTY session',
+      available: canRunTerminal(),
+    },
+    {
+      id: 'network',
+      displayName: 'Network',
+      description: 'Outbound HTTP/HTTPS requests',
+      available: true,
+    },
+    {
+      id: 'notifications',
+      displayName: 'Notifications',
+      description: 'Desktop notifications via notify-send',
+      available: canSendNotifications(),
+    },
+    {
+      id: 'process',
+      displayName: 'Process Management',
+      description: 'List and inspect running processes',
+      available: true,
+    },
+    {
+      id: 'sudo',
+      displayName: 'Elevated Privileges',
+      description: 'Sudo / setuid elevation (only available if root or sudo configured)',
+      available: isRoot || hasSudo(),
+    },
+  ];
+
+  const workspaceRoots: WorkspaceRootDescriptor[] = [
+    {
+      id: 'main',
+      path: workspaceRoot,
+      displayName: workspaceRoot,
+      writable: isWritable(workspaceRoot),
+    },
+  ];
+
+  const onboardingRequirements: HostOnboardingRequirement[] = [
+    {
+      id: 'filesystem_access',
+      title: 'Filesystem access',
+      description: `Read/write access to ${workspaceRoot}`,
+      satisfied: canAccessFilesystem(workspaceRoot),
+    },
+    {
+      id: 'terminal_access',
+      title: 'Terminal access',
+      description: 'Shell execution capability',
+      satisfied: canRunTerminal(),
+    },
+  ];
+
+  return {
+    id: `linux-${process.pid}`,
+    displayName: `Linux (${priv}${isRoot ? ' +root' : ''}${isolation !== 'none' ? ` in ${isolation}` : ''})`,
+    platform: 'linux',
+    privilege: priv,
+    isolation,
+    capabilities,
+    workspaceRoots,
+    onboardingRequirements,
+  };
+}
+
+// --- Detection helpers ---
+
+function canAccessFilesystem(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function isWritable(p: string): boolean {
+  try {
+    statSync(p);
+    return true; // we'll know for sure on first write attempt
+  } catch {
+    return false;
+  }
+}
+
+function canRunTerminal(): boolean {
+  return ['bash', 'sh', 'zsh', 'fish'].some((shell) => {
+    try {
+      const { execSync } = require('node:child_process');
+      execSync(`which ${shell}`, { stdio: 'pipe' });
+      return true;
+    } catch {
+      return false;
+    }
+  });
+}
+
+function canSendNotifications(): boolean {
+  try {
+    const { execSync } = require('node:child_process');
+    execSync('which notify-send', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasSudo(): boolean {
+  try {
+    const { execSync } = require('node:child_process');
+    execSync('which sudo', { stdio: 'pipe' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readCgroupInfo(): Promise<string> {
+  try {
+    const fs = await import('node:fs/promises');
+    return await fs.readFile('/proc/1/cgroup', 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+async function readInitProcessName(): Promise<string> {
+  try {
+    const fs = await import('node:fs/promises');
+    return await fs.readFile('/proc/1/sched', 'utf8');
+  } catch {
+    return '';
+  }
+}
